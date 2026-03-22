@@ -228,6 +228,11 @@ class MazeLoader:
         px = cell_col * self.CELL_SIZE + self.CELL_SIZE // 2
         return py, px
 
+    def pixel_to_cell(self, pixel_y, pixel_x): # convert pixel to cell coords
+        r = min(max(pixel_y // self.CELL_SIZE, 0), self.maze_height_cells - 1)
+        c = min(max(pixel_x // self.CELL_SIZE, 0), self.maze_width_cells - 1)
+        return (r, c)
+
     # draw markers where hazards were detected
     def visualize_hazards(self, output_path, base_image_path=None):
         viz_img = Image.open(base_image_path).convert("RGB") if base_image_path else self.img.copy()

@@ -11,7 +11,6 @@ INNER = CELL - 2 * WALL  # 14
 OUT_DIR = "templates"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# Change this to your hazard maze image
 IMG_PATH = "MAZE_1.png"
 
 img = cv2.imread(IMG_PATH, cv2.IMREAD_COLOR)
