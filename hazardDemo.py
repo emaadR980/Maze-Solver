@@ -1,7 +1,8 @@
 from enum import Enum
 from typing import List, Tuple, Optional
 from maze import MazeLoader
-
+from collections import deque
+from PIL import Image
 
 class Action(Enum):
     MOVE_UP = 0
@@ -75,11 +76,15 @@ class MazeEnvironment:
         self.goal_cell = self.loader.pixel_to_cell(gp[0], gp[1])
 
         # hazard sets cell coords as tuples for fast lookup
-        self.death_pits    = set(map(tuple, self.loader.death_pits))
+        self.death_pits = set(map(tuple, self.loader.death_pits))
+        self.initial_death_pits = set(self.death_pits)
+        # store clusters of fire pits to rotate together
+        self.fire_clusters: List[List[Tuple[int, int]]] = self.group_clusters(self.death_pits)
+        self.initial_fire_clusters = [list(cluster) for cluster in self.fire_clusters]
         self.confusion_pads = set(map(tuple, self.loader.confusion_pads))
 
-        # hazard cells contain colored emojis whose dark pixels make them appear as
-        # walls in the grayscale maze_array so force all detected hazard cells passable
+        # hazard cells contain colored emojis so dark pixels make them appear as walls in grayscale
+        # so force all detected hazards to be passbable
         all_hazard_cells = (
             self.death_pits
             | self.confusion_pads
@@ -107,6 +112,114 @@ class MazeEnvironment:
         self.cells_explored: set  = set()
         self.episode_active: bool = True
 
+    def group_clusters(self, cells: set, max_gap: int = 8) -> List[List[Tuple[int, int]]]:
+        # group cells into clusters using BFS where neighbors are within max_gap in both row and col
+        remaining = set(cells)
+        clusters = []
+        while remaining:
+            seed = next(iter(remaining))
+            cluster = []
+            queue = [seed]
+            remaining.discard(seed)
+            while queue:
+                cell = queue.pop()
+                cluster.append(cell)
+                for other in list(remaining):
+                    if abs(other[0] - cell[0]) <= max_gap and abs(other[1] - cell[1]) <= max_gap:
+                        remaining.discard(other)
+                        queue.append(other)
+            clusters.append(cluster)
+        return clusters
+
+    def cluster_orientation_and_pivot(self, cluster: List[Tuple[int, int]]) -> Tuple[str, Tuple[int, int]]:
+        # v : bottom row has the single tip cell
+        # ^ : top row has the single tip cell
+        # < : left column has the single tip cell
+        # > : right column has the single tip cell
+
+        # count how many cells in the cluster are in each row and column
+        # if the cluster is wider than it is tall, orientation is vertical and tip is in row with fewest cells
+        # if the cluster is taller than it is wide, orientation is horizontal and tip is in column with fewest cells
+    
+        rows = [r for r, _ in cluster]
+        cols = [c for _, c in cluster]
+
+        min_r, max_r = min(rows), max(rows)
+        min_c, max_c = min(cols), max(cols)
+
+        row_counts = {r: 0 for r in range(min_r, max_r + 1)}
+        col_counts = {c: 0 for c in range(min_c, max_c + 1)}
+        for r, c in cluster:
+            row_counts[r] = row_counts.get(r, 0) + 1
+            col_counts[c] = col_counts.get(c, 0) + 1
+
+        width = max_c - min_c + 1
+        height = max_r - min_r + 1
+
+        # if cluster is wider than tall, orientation is vertical and tip is in row with fewest cells
+        # else orientation is horizontal and tip is in column with fewest cells
+        if width >= height:
+            if row_counts.get(max_r, 0) <= row_counts.get(min_r, 0):
+                pivot_candidates = [cell for cell in cluster if cell[0] == max_r]
+                return "v", min(pivot_candidates, key=lambda cell: abs(cell[1] - sum(cols) / len(cols)))
+            pivot_candidates = [cell for cell in cluster if cell[0] == min_r]
+            return "^", min(pivot_candidates, key=lambda cell: abs(cell[1] - sum(cols) / len(cols)))
+
+        # if left column has fewer cells than right column, orientation is horizontal and tip is in left column, else tip is in right column
+        if col_counts.get(min_c, 0) <= col_counts.get(max_c, 0): # 
+            pivot_candidates = [cell for cell in cluster if cell[1] == min_c]
+            return "<", min(pivot_candidates, key=lambda cell: abs(cell[0] - sum(rows) / len(rows)))
+        
+        pivot_candidates = [cell for cell in cluster if cell[1] == max_c]
+        return ">", min(pivot_candidates, key=lambda cell: abs(cell[0] - sum(rows) / len(rows)))
+
+    # rotate ONE cluster 90 deg clockwise around tip of v and dont draw pits outside of maze 
+    def rotate_fire_cluster(self, cluster: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        h = self.loader.maze_height_cells
+        w = self.loader.maze_width_cells
+
+        _orientation, pivot = self.cluster_orientation_and_pivot(cluster)
+        pr, pc = pivot
+
+        rotated = []
+        seen = set()
+        for r, c in cluster:
+            dr = r - pr
+            dc = c - pc
+            nr = pr + dc
+            nc = pc - dr
+            if 0 <= nr < h and 0 <= nc < w:
+                cell = (nr, nc)
+                if cell not in seen:
+                    seen.add(cell)
+                    rotated.append(cell)
+
+        return sorted(rotated)
+
+    # rotate all clusters
+    def rotate_fire_clusters(self): 
+        # restore original passability for old pit cells
+        for r, c in self.death_pits:
+            py = r * self.CELL_SIZE + self.CELL_SIZE // 2
+            px = c * self.CELL_SIZE + self.CELL_SIZE // 2
+            py = min(py, self.loader.maze_array.shape[0] - 1)
+            px = min(px, self.loader.maze_array.shape[1] - 1)
+            self.grid[r][c] = bool(self.loader.maze_array[py, px])
+
+        new_clusters = []
+        new_death_pits = set()
+        for cluster in self.fire_clusters:
+            rotated = self.rotate_fire_cluster(cluster)
+            new_clusters.append(rotated)
+            new_death_pits.update(rotated)
+
+        self.fire_clusters = new_clusters
+        self.death_pits = new_death_pits
+
+        # fire pit passable so it can trigger
+        for r, c in self.death_pits:
+            self.grid[r][c] = True
+
     def reset(self) -> Tuple[int, int]: # reset episode and return to start
         self.agent_pos = self.start_cell
         self.turn_count = 0
@@ -115,9 +228,24 @@ class MazeEnvironment:
         self.confused_turns_left = 0
         self.cells_explored = set()
         self.episode_active = True
+
+        # restore original fire pit layout on reset
+        for r, c in self.death_pits:
+            py = r * self.CELL_SIZE + self.CELL_SIZE // 2
+            px = c * self.CELL_SIZE + self.CELL_SIZE // 2
+            py = min(py, self.loader.maze_array.shape[0] - 1)
+            px = min(px, self.loader.maze_array.shape[1] - 1)
+            self.grid[r][c] = bool(self.loader.maze_array[py, px])
+
+        self.death_pits = set(self.initial_death_pits)
+        self.fire_clusters = [list(cluster) for cluster in self.initial_fire_clusters]
+
+        for r, c in self.death_pits:
+            self.grid[r][c] = True
+
         return self.agent_pos
 
-    def _is_passable(self, row: int, col: int) -> bool: # check if cell is within bounds and not a wall
+    def is_passable(self, row: int, col: int) -> bool: # check if cell is within bounds and not a wall
         h = self.loader.maze_height_cells
         w = self.loader.maze_width_cells
         if not (0 <= row < h and 0 <= col < w):
@@ -147,7 +275,7 @@ class MazeEnvironment:
             nr, nc = r + dr, c + dc
 
             # check wall
-            if not self._is_passable(nr, nc):
+            if not self.is_passable(nr, nc):
                 result.wall_hits += 1
                 result.actions_executed += 1
                 continue
@@ -187,11 +315,15 @@ class MazeEnvironment:
                 self.episode_active = False
                 break
 
-        result.current_position = self.agent_pos
+        if not result.is_dead:
+            result.current_position = self.agent_pos
 
         # decrement confusion counter at end of turn
         if self.confused_turns_left > 0:
             self.confused_turns_left -= 1
+
+        # rotate all fire clusters 90 degrees clockwise after actions complete
+        self.rotate_fire_clusters()
 
         self.turn_count += 1
         return result
@@ -205,6 +337,25 @@ class MazeEnvironment:
             "goal_reached": not self.episode_active,
         }
 
+# draw red square over every death pit cell and save to output_path
+def visualize_fire_pits(env: MazeEnvironment, output_path: str, base_image_path: str): # <- should move this to mazeEnv class and update the calss
+    # draw a red square over every current death pit cell and save to output_path
+    img = Image.open(base_image_path).convert("RGB")
+    pixels = img.load()
+    marker = 4
+    h, w = env.loader.h, env.loader.w
+
+    for r, c in env.death_pits:
+        py = r * env.CELL_SIZE + env.CELL_SIZE // 2
+        px = c * env.CELL_SIZE + env.CELL_SIZE // 2
+        for dy in range(-marker, marker + 1):
+            for dx in range(-marker, marker + 1):
+                ny, nx = py + dy, px + dx
+                if 0 <= ny < h and 0 <= nx < w:
+                    pixels[nx, ny] = (255, 0, 0)
+
+    img.save(output_path)
+    print(f"  Saved {output_path}  ({len(env.death_pits)} fire pits drawn)")
 
 # scripted to try each hazard
 class DemoAgent:
@@ -213,7 +364,6 @@ class DemoAgent:
 
     # BFS pathfinding to target cell optionally avoiding certain cells
     def path_to(self, target: Tuple[int, int], avoid: set = None) -> List[Action]: 
-        from collections import deque
         start = self.env.agent_pos
         if start == target:
             return []
@@ -232,7 +382,7 @@ class DemoAgent:
                 nxt = (r + dr, c + dc)
                 if (nxt not in visited
                         and nxt not in avoid
-                        and self.env._is_passable(nxt[0], nxt[1])):
+                        and self.env.is_passable(nxt[0], nxt[1])):
                     visited[nxt] = ((r, c), action)
                     queue.append(nxt)
 
@@ -277,7 +427,7 @@ class DemoAgent:
         ]
         
         for adj, step_action in candidates:
-            if not self.env._is_passable(adj[0], adj[1]):
+            if not self.env.is_passable(adj[0], adj[1]):
                 continue
             if self.env.agent_pos != adj:
                 self.walk_to(adj, avoid=avoid)
@@ -380,11 +530,21 @@ class DemoAgent:
             print(f"  {k:<20}: {v}")
         print(f"{sep}\n")
 
-
 if __name__ == "__main__":
+    MAZE_PATH = "MAZE_1.png"
+
     print("Loading maze with hazards")
-    env = MazeEnvironment("MAZE_1.png")
+    env = MazeEnvironment(MAZE_PATH)
     env.reset()
 
     agent = DemoAgent(env)
     agent.run_demo()
+
+    # fire rotation visualization
+    print("Visualizing fire pit rotation...")
+    env.reset()
+    env.confused_turns_left = 0
+
+    visualize_fire_pits(env, "fire_before.png", MAZE_PATH)
+    env.step([Action.WAIT] * 5)  # one full turn triggers rotation
+    visualize_fire_pits(env, "fire_after.png", MAZE_PATH)
