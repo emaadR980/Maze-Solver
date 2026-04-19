@@ -1,67 +1,83 @@
 import os
+import sys
 from collections import deque
 import numpy as np
 from PIL import Image
 import cv2
 import glob
 
-# use opencv to load templates and do template matching to find hazards in the maze 
+# use opencv to load templates and do template matching to find hazards in the maze
 class CvTemplateHazards:
-    """
-    Template matching on 14x14 cell interiors using OpenCV.
-    Uses a foreground mask to reduce background (white) influence.
-    """
 
     def __init__(self, templates_by_label, size=(14, 14)):
         self.size = tuple(size)
         self.templates = {}  # label -> list[BGR template (14,14,3)]
+        self.label_mean_bgr = {}  # label -> avg foreground BGR prototype
 
         for label, paths in templates_by_label.items():
             arrs = []
+            means = []
             for p in paths:
                 t = cv2.imread(p, cv2.IMREAD_COLOR)  # read in bgr
                 if t is None:
                     continue
                 t = cv2.resize(t, self.size, interpolation=cv2.INTER_NEAREST)
                 arrs.append(t)
+                mean_bgr = self.foreground_mean_bgr(t)
+                if mean_bgr is not None:
+                    means.append(mean_bgr)
             if arrs:
                 self.templates[label] = arrs
+            if means:
+                self.label_mean_bgr[label] = np.mean(np.vstack(means), axis=0)
 
         if not self.templates:
             raise RuntimeError("no templates loaded. Check template folder.")
 
-    @staticmethod # simple operation that doesnt need self, just following convention i saw on reddit while searching
-    # mask pixels that are not plain white, keep darker/saturated pixels
-    # helps identify the hazards by getting rid of the white
+    @staticmethod
     def mask_foreground(bgr14):
         hsv = cv2.cvtColor(bgr14, cv2.COLOR_BGR2HSV)
         h, s, v = cv2.split(hsv)
-
-        # keep if not near white or has decent saturation
         mask = ((v < 250) | (s > 20)).astype(np.uint8) * 255
         return mask
 
-    # returns best label, best score, and dict of all scores by label
-    # used to classify a cell patch as one of the hazard types or None if no good match
+    @staticmethod
+    def foreground_mean_bgr(bgr14):
+        mask = CvTemplateHazards.mask_foreground(bgr14) > 0
+        if int(mask.sum()) == 0:
+            return None
+        return bgr14[mask].mean(axis=0)
+
+    def color_distances(self, bgr14):
+        mean_bgr = self.foreground_mean_bgr(bgr14)
+        if mean_bgr is None:
+            return {}
+        return {
+            label: float(np.linalg.norm(mean_bgr - proto))
+            for label, proto in self.label_mean_bgr.items()
+        }
+
     def classify(self, bgr14):
         patch = cv2.resize(bgr14, self.size, interpolation=cv2.INTER_NEAREST)
-        mask = self.mask_foreground(patch)
 
-        if cv2.countNonZero(mask) < 15:
+        if cv2.countNonZero(self.mask_foreground(patch)) < 30:
             return None, -1.0, {}
 
         scores_by_label = {}
         best_label = None
         best_score = -1.0
 
-        # loop through each label and its templates and keep the best score for that label
         for label, tmpl_list in self.templates.items():
             label_best = -1.0
             for tmpl in tmpl_list:
                 patch_m = patch.copy()
                 tmpl_m = tmpl.copy()
 
-                bg = (mask == 0)
+                tmpl_mask = self.mask_foreground(tmpl_m)
+                if cv2.countNonZero(tmpl_mask) < 30:
+                    continue
+
+                bg = (tmpl_mask == 0)
                 patch_m[bg] = 255
                 tmpl_m[bg] = 255
 
@@ -78,13 +94,12 @@ class CvTemplateHazards:
         return best_label, best_score, scores_by_label
 
 # load templates from ./templates directory
-# uses same naming format at make_templates.py
 def load_templates_from_dir(template_dir="templates"):
-    labels = ["confusion", "death_pit", "teleport_orange", "teleport_green", "teleport_purple"]
+    labels = ["confusion", "death_pit", "teleport_orange", "teleport_green", "teleport_purple", "teleport_red"]
     templates_by_label = {}
 
     for lab in labels:
-        patterns = [ # patterns to match image extensions (computer was being weird this worked)
+        patterns = [
             os.path.join(template_dir, f"{lab}_*.png"),
             os.path.join(template_dir, f"{lab}_*.jpg"),
             os.path.join(template_dir, f"{lab}_*.jpeg"),
@@ -97,26 +112,23 @@ def load_templates_from_dir(template_dir="templates"):
         if files:
             templates_by_label[lab] = files
 
-    # templates not loaded
     if not templates_by_label:
         raise RuntimeError(f"No templates found in '{template_dir}'.")
 
     return templates_by_label
 
 
-# load maze, detect hazards, solve with BFS
 class MazeLoader:
     CELL_SIZE = 16
     WALL_THICKNESS = 2
     INNER_SIZE = CELL_SIZE - 2 * WALL_THICKNESS  # 14x14px
 
-    def __init__(self, image_path, template_dir="templates", template_threshold=0.60):
+    def __init__(self, image_path, template_dir="templates", template_threshold=0.70):
         self.image_path = image_path
         self.img = Image.open(image_path).convert("RGB")
         self.rgb_array = np.array(self.img)
         self.h, self.w = self.rgb_array.shape[:2]
 
-        # binary maze array for navigation where true = open and false = wall
         gray_img = self.img.convert("L")
         self.maze_array = np.array(gray_img) > 128
 
@@ -126,22 +138,19 @@ class MazeLoader:
         self.start_pos = self.find_middle_opening("bottom")
         self.goal_pos = self.find_middle_opening("top")
 
-        # hazard locations
         self.death_pits = []
         self.confusion_pads = []
         self.teleport_purple = []
         self.teleport_orange = []
         self.teleport_green = []
+        self.teleport_red = []
 
-        # convert to bgr for opencv template matching
         self.bgr = cv2.cvtColor(self.rgb_array, cv2.COLOR_RGB2BGR)
 
-        # load templates and initialize matcher
         templates_by_label = load_templates_from_dir(template_dir)
         self.matcher = CvTemplateHazards(templates_by_label, size=(self.INNER_SIZE, self.INNER_SIZE))
         self.template_threshold = float(template_threshold)
 
-    # locate the openinngs on top/bottom (for start/end)
     def find_middle_opening(self, edge):
         mid = self.w // 2
         search_range = 100
@@ -154,38 +163,94 @@ class MazeLoader:
 
         return openings[len(openings) // 2] if openings else None
 
-    # extract the inside 14x14px for template matching
     def cell_interior_bgr(self, cell_row, cell_col):
         y0 = cell_row * self.CELL_SIZE + self.WALL_THICKNESS
         x0 = cell_col * self.CELL_SIZE + self.WALL_THICKNESS
         return self.bgr[y0:y0 + self.INNER_SIZE, x0:x0 + self.INNER_SIZE]
 
-    # classify cell using template matching
     def classify_cell_template(self, cell_row, cell_col):
         patch = self.cell_interior_bgr(cell_row, cell_col)
         label, score, scores = self.matcher.classify(patch)
+        color_dists = self.matcher.color_distances(patch)
+
+        fallback = self.color_fallback_label(scores, color_dists)
 
         if label is None:
-            return None
+            return fallback
         if score < self.template_threshold:
-            return None
+            return fallback
 
-        # tie breaker to distinguish between orange tp and death pit
-        if label == "teleport_orange" and "death_pit" in scores:
-            death_score = scores["death_pit"]
-            orange_score = scores.get("teleport_orange", -1.0)
+        if label == "death_pit":
+            fg_mask = ~((patch[:,:,0]>235) & (patch[:,:,1]>235) & (patch[:,:,2]>235))
+            fg_count = int(fg_mask.sum())
+            if fg_count > 0:
+                mean_r = float(patch[:,:,2][fg_mask].mean())  # BGR: channel 2 = R
+                mean_g = float(patch[:,:,1][fg_mask].mean())  # BGR: channel 1 = G
+                gr_ratio = mean_g / mean_r if mean_r > 0 else 1.0
+            else:
+                gr_ratio = 1.0
 
-            # if death is within this margin of orange, assume death
-            MARGIN = 0.03
+            runner_up = sorted(
+                ((k, v_) for k, v_ in scores.items() if k != "death_pit"),
+                key=lambda x: -x[1]
+            )
+            best_runner_label = runner_up[0][0] if runner_up else None
+            best_runner_score = runner_up[0][1] if runner_up else -1.0
 
-            if death_score >= orange_score - MARGIN:
-                # fire emoji is a bit darker than the orange tp pads, using this to fix some misclassifications
-                hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-                mean_v = float(np.mean(hsv[..., 2])) / 255.0
-                if mean_v <= 0.90:
+            override = False
+            if gr_ratio >= 0.76:
+                override = True
+            elif gr_ratio >= 0.68:
+                if best_runner_score >= score - 0.12:
+                    override = True
+
+            if override:
+                if fallback is not None:
+                    return fallback
+                if best_runner_label and best_runner_score >= self.template_threshold - 0.10:
+                    return best_runner_label
+                return None
+
+        if label == "teleport_red":
+            fg_mask = ~((patch[:,:,0]>235) & (patch[:,:,1]>235) & (patch[:,:,2]>235))
+            fg_count = int(fg_mask.sum())
+            if fg_count > 0:
+                mean_r = float(patch[:,:,2][fg_mask].mean())
+                mean_g = float(patch[:,:,1][fg_mask].mean())
+                gr_ratio = mean_g / mean_r if mean_r > 0 else 1.0
+            else:
+                gr_ratio = 1.0
+            if gr_ratio >= 0.40:
+                dp_score = scores.get("death_pit", -1.0)
+                if dp_score >= self.template_threshold:
                     return "death_pit"
+                return None
+
+        if label == "death_pit" and fallback is not None:
+            return fallback
 
         return label
+
+    def color_fallback_label(self, scores, color_dists):
+        if not color_dists:
+            return None
+
+        fallback_rules = [
+            ("confusion", 20.0, 0.42),
+            ("teleport_orange", 28.0, 0.42),
+            ("teleport_green", 28.0, 0.32),
+        ]
+
+        best_label = None
+        best_score = -1.0
+        for label, max_dist, min_score in fallback_rules:
+            score = scores.get(label, -1.0)
+            dist = color_dists.get(label, float("inf"))
+            if dist <= max_dist and score >= min_score and score > best_score:
+                best_label = label
+                best_score = score
+
+        return best_label
 
     def detect_hazards(self):
         print(f"searching {self.maze_height_cells}×{self.maze_width_cells} cells for hazards")
@@ -208,6 +273,8 @@ class MazeLoader:
                     self.teleport_orange.append((r, c))
                 elif lab == "teleport_green":
                     self.teleport_green.append((r, c))
+                elif lab == "teleport_red":
+                    self.teleport_red.append((r, c))
 
         print(f"Found {detected} hazardous cells")
         return self.get_hazard_summary()
@@ -219,6 +286,7 @@ class MazeLoader:
             "teleport_purple": len(self.teleport_purple),
             "teleport_orange": len(self.teleport_orange),
             "teleport_green": len(self.teleport_green),
+            "teleport_red": len(self.teleport_red),
             "start_pos": self.start_pos,
             "goal_pos": self.goal_pos,
         }
@@ -228,27 +296,27 @@ class MazeLoader:
         px = cell_col * self.CELL_SIZE + self.CELL_SIZE // 2
         return py, px
 
-    def pixel_to_cell(self, pixel_y, pixel_x): # convert pixel to cell coords
+    def pixel_to_cell(self, pixel_y, pixel_x):
         r = min(max(pixel_y // self.CELL_SIZE, 0), self.maze_height_cells - 1)
         c = min(max(pixel_x // self.CELL_SIZE, 0), self.maze_width_cells - 1)
         return (r, c)
 
-    # draw markers where hazards were detected
-    def visualize_hazards(self, output_path, base_image_path=None):
+    def visualize_hazards(self, output_path, base_image_path=None, rotating_pits=None):
         viz_img = Image.open(base_image_path).convert("RGB") if base_image_path else self.img.copy()
         pixels = viz_img.load()
         marker = 4
 
-        # Death pits labeled with red
+        rotating_pits = set(rotating_pits) if rotating_pits else set()
+
         for r, c in self.death_pits:
+            color = (255, 140, 30) if (r, c) in rotating_pits else (180, 0, 0)
             py, px = self.cell_to_pixel(r, c)
             for dy in range(-marker, marker + 1):
                 for dx in range(-marker, marker + 1):
                     ny, nx = py + dy, px + dx
                     if 0 <= ny < self.h and 0 <= nx < self.w:
-                        pixels[nx, ny] = (255, 0, 0)
+                        pixels[nx, ny] = color
 
-        # confusion pads labeled with yellow
         for r, c in self.confusion_pads:
             py, px = self.cell_to_pixel(r, c)
             for dy in range(-marker, marker + 1):
@@ -257,7 +325,6 @@ class MazeLoader:
                     if 0 <= ny < self.h and 0 <= nx < self.w:
                         pixels[nx, ny] = (255, 255, 0)
 
-        # purple tp pads
         for r, c in self.teleport_purple:
             py, px = self.cell_to_pixel(r, c)
             for dy in range(-marker, marker + 1):
@@ -266,7 +333,6 @@ class MazeLoader:
                     if 0 <= ny < self.h and 0 <= nx < self.w:
                         pixels[nx, ny] = (128, 0, 255)
 
-        # orange tp pads
         for r, c in self.teleport_orange:
             py, px = self.cell_to_pixel(r, c)
             for dy in range(-marker, marker + 1):
@@ -275,7 +341,6 @@ class MazeLoader:
                     if 0 <= ny < self.h and 0 <= nx < self.w:
                         pixels[nx, ny] = (255, 140, 0)
 
-        # green tp pads
         for r, c in self.teleport_green:
             py, px = self.cell_to_pixel(r, c)
             for dy in range(-marker, marker + 1):
@@ -284,7 +349,14 @@ class MazeLoader:
                     if 0 <= ny < self.h and 0 <= nx < self.w:
                         pixels[nx, ny] = (0, 255, 0)
 
-        # start/end labeled with cyan
+        for r, c in self.teleport_red:
+            py, px = self.cell_to_pixel(r, c)
+            for dy in range(-marker, marker + 1):
+                for dx in range(-marker, marker + 1):
+                    ny, nx = py + dy, px + dx
+                    if 0 <= ny < self.h and 0 <= nx < self.w:
+                        pixels[nx, ny] = (220, 0, 255)
+
         for pos in [self.start_pos, self.goal_pos]:
             if not pos:
                 continue
@@ -330,7 +402,8 @@ def solve_maze_bfs(maze, start, end):
 
 
 def main():
-    loader = MazeLoader("MAZE_1.png", template_dir="templates", template_threshold=0.55)
+    maze_path = sys.argv[1] if len(sys.argv) > 1 else "maze-alpha/MAZE_1.png"
+    loader = MazeLoader(maze_path, template_dir="templates")
 
     print(f"\nImage: {loader.w}×{loader.h}")
     print(f"Grid: {loader.maze_width_cells}×{loader.maze_height_cells} cells")
@@ -345,11 +418,12 @@ def main():
     print(f"- Purple teleports: {summary['teleport_purple']}")
     print(f"- Orange teleports: {summary['teleport_orange']}")
     print(f"- Green teleports: {summary['teleport_green']}")
+    print(f"- Red teleports: {summary['teleport_red']}")
 
-    total = (summary["death_pits"] + summary["confusion"] + summary["teleport_purple"] + summary["teleport_orange"] + summary["teleport_green"])
+    total = (summary["death_pits"] + summary["confusion"] + summary["teleport_purple"] + summary["teleport_orange"] + summary["teleport_green"] + summary["teleport_red"])
     print(f"Total hazardous cells: {total}")
 
-    loader.visualize_hazards("maze_detected_hazards.png", base_image_path="MAZE_1.png")
+    loader.visualize_hazards("maze_detected_hazards.png", base_image_path=maze_path)
 
     print("\nBFS")
     path = solve_maze_bfs(loader.maze_array, loader.start_pos, loader.goal_pos)
