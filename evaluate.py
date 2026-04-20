@@ -14,7 +14,6 @@ agent = MazeAgent()
 agent.load("agent.pkl")
 agent.goal_pos = env.goal_cell
 agent.epsilon = 0.0
-agent.env = env
 
 agent.known = {}
 agent.wall_edges = set()

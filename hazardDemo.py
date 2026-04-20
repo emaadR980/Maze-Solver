@@ -184,10 +184,19 @@ class MazeEnvironment:
 
         pr, pc = pivot
         completed = set(cluster)
-        for r, c in cluster:
-            reflected = (2 * pr - r, 2 * pc - c)
-            if not self.is_cell_in_bounds(*reflected):
-                completed.add(reflected)
+
+        if any(c == 0 for r, c in cluster):
+            # Left-wall cluster: the visible half starts inside the maze, and
+            # the matching leg starts outside so the east-facing phase is a
+            # full 7-cell V around the pivot.
+            for k in range(1, 4):
+                completed.add((pr - k, pc - k))
+        else:
+            for r, c in cluster:
+                reflected = (2 * pr - r, 2 * pc - c)
+                if not self.is_cell_in_bounds(*reflected):
+                    completed.add(reflected)
+
         return sorted(completed)
 
     def rotate_fire_cluster(self, cluster: List[Tuple[int, int]],
@@ -379,7 +388,7 @@ class MazeEnvironment:
 
         self.turn_count += 1
 
-        if self.rotate_fire_enabled and self.turn_count % 5 == 0:
+        if self.rotate_fire_enabled:
             self.rotate_fire_clusters()
 
             if not result.is_dead and self.agent_pos in self.death_pits:

@@ -11,10 +11,8 @@ DEBUG_HAZARDS = (len(sys.argv) > 5 and sys.argv[5].lower() in {"1", "true", "yes
 
 env   = MazeEnvironment(MAZE_PATH, rotate_fire=True)
 agent = MazeAgent()
-agent.load("agent.pkl")
 agent.goal_pos = env.goal_cell
 agent.epsilon = 0.0
-agent.env = env
 
 agent.known = {}
 agent.wall_edges = set()

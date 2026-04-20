@@ -7,7 +7,6 @@ MAZE_PATH    = "maze-alpha/MAZE_1.png"
 
 env   = MazeEnvironment(MAZE_PATH)
 agent = MazeAgent()
-agent.env = env
 
 successes = 0
 
