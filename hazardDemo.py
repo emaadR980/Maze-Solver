@@ -80,7 +80,16 @@ class MazeEnvironment:
         self.death_pits = set(map(tuple, self.loader.death_pits))
         self.initial_death_pits = set(self.death_pits)
         self.fire_clusters: List[List[Tuple[int, int]]] = self.group_clusters(self.death_pits)
+        self.fire_cluster_pivots: List[Tuple[int, int]] = [
+            self.cluster_orientation_and_pivot(cluster)[1]
+            for cluster in self.fire_clusters
+        ]
+        self.fire_clusters = [
+            self.complete_edge_fire_cluster(cluster, pivot)
+            for cluster, pivot in zip(self.fire_clusters, self.fire_cluster_pivots)
+        ]
         self.initial_fire_clusters = [list(cluster) for cluster in self.fire_clusters]
+        self.initial_fire_cluster_pivots = list(self.fire_cluster_pivots)
         self.confusion_pads = set(map(tuple, self.loader.confusion_pads))
 
         all_hazard_cells = (
@@ -163,11 +172,28 @@ class MazeEnvironment:
         pivot_candidates = [cell for cell in cluster if cell[1] == max_c]
         return ">", min(pivot_candidates, key=lambda cell: abs(cell[0] - sum(rows) / len(rows)))
 
-    def rotate_fire_cluster(self, cluster: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        h = self.loader.maze_height_cells
-        w = self.loader.maze_width_cells
+    def complete_edge_fire_cluster(self, cluster: List[Tuple[int, int]],
+                                   pivot: Tuple[int, int]) -> List[Tuple[int, int]]:
+        if not any(
+            r == 0 or c == 0
+            or r == self.loader.maze_height_cells - 1
+            or c == self.loader.maze_width_cells - 1
+            for r, c in cluster
+        ):
+            return sorted(set(cluster))
 
-        _orientation, pivot = self.cluster_orientation_and_pivot(cluster)
+        pr, pc = pivot
+        completed = set(cluster)
+        for r, c in cluster:
+            reflected = (2 * pr - r, 2 * pc - c)
+            if not self.is_cell_in_bounds(*reflected):
+                completed.add(reflected)
+        return sorted(completed)
+
+    def rotate_fire_cluster(self, cluster: List[Tuple[int, int]],
+                            pivot: Optional[Tuple[int, int]] = None) -> List[Tuple[int, int]]:
+        if pivot is None:
+            _orientation, pivot = self.cluster_orientation_and_pivot(cluster)
         pr, pc = pivot
 
         rotated = []
@@ -177,13 +203,18 @@ class MazeEnvironment:
             dc = c - pc
             nr = pr + dc
             nc = pc - dr
-            if 0 <= nr < h and 0 <= nc < w:
-                cell = (nr, nc)
-                if cell not in seen:
-                    seen.add(cell)
-                    rotated.append(cell)
+            cell = (nr, nc)
+            if cell not in seen:
+                seen.add(cell)
+                rotated.append(cell)
 
         return sorted(rotated)
+
+    def is_cell_in_bounds(self, r: int, c: int) -> bool:
+        return (
+            0 <= r < self.loader.maze_height_cells
+            and 0 <= c < self.loader.maze_width_cells
+        )
 
     # rotate all clusters
     def rotate_fire_clusters(self):
@@ -199,10 +230,12 @@ class MazeEnvironment:
 
         new_clusters = []
         new_death_pits = set()
-        for cluster in self.fire_clusters:
-            rotated = self.rotate_fire_cluster(cluster)
+        for cluster, pivot in zip(self.fire_clusters, self.fire_cluster_pivots):
+            rotated = self.rotate_fire_cluster(cluster, pivot)
             new_clusters.append(rotated)
-            new_death_pits.update(rotated)
+            new_death_pits.update(
+                cell for cell in rotated if self.is_cell_in_bounds(*cell)
+            )
 
         self.fire_clusters = new_clusters
         self.death_pits = new_death_pits
@@ -211,6 +244,14 @@ class MazeEnvironment:
             self.grid[r][c] = True
 
     def reset(self) -> Tuple[int, int]:
+        for r, c in self.death_pits:
+            if self.is_cell_in_bounds(r, c):
+                py = r * self.CELL_SIZE + self.CELL_SIZE // 2
+                px = c * self.CELL_SIZE + self.CELL_SIZE // 2
+                py = min(py, self.loader.maze_array.shape[0] - 1)
+                px = min(px, self.loader.maze_array.shape[1] - 1)
+                self.grid[r][c] = bool(self.loader.maze_array[py, px])
+
         self.agent_pos = self.start_cell
         self.turn_count = 0
         self.death_count = 0
@@ -222,6 +263,7 @@ class MazeEnvironment:
 
         self.death_pits = set(self.initial_death_pits)
         self.fire_clusters = [list(cluster) for cluster in self.initial_fire_clusters]
+        self.fire_cluster_pivots = list(self.initial_fire_cluster_pivots)
 
         for r, c in self.death_pits:
             self.grid[r][c] = True
@@ -249,39 +291,23 @@ class MazeEnvironment:
 
         if dr == 0:  # horizontal
             right_c = max(from_c, to_c)
-            right_is_hazard = to_hazard if to_c == right_c else from_hazard
 
             wall_x = right_c * CELL + BORDER
             y = min(from_r * CELL + CELL // 2 + BORDER, ma.shape[0] - 1)
 
-            if right_is_hazard:
-                left_is_hazard = from_hazard if to_c == right_c else to_hazard
-                if left_is_hazard:
-                    return True
-                x = min(wall_x - 2, ma.shape[1] - 1)
-                return bool(ma[y, x])
-            else:
-                x_left  = min(wall_x - 1, ma.shape[1] - 1)
-                x_right = min(wall_x + 1, ma.shape[1] - 1)
-                return bool(ma[y, x_left]) and bool(ma[y, x_right])
+            x_left  = min(wall_x - 1, ma.shape[1] - 1)
+            x_right = min(wall_x + 1, ma.shape[1] - 1)
+            return bool(ma[y, x_left]) and bool(ma[y, x_right])
 
         else:  # vertical
             bottom_r = max(from_r, to_r)
-            bottom_is_hazard = to_hazard if to_r == bottom_r else from_hazard
 
             wall_y = bottom_r * CELL + BORDER
             x = min(from_c * CELL + CELL // 2 + BORDER, ma.shape[1] - 1)
 
-            if bottom_is_hazard:
-                top_is_hazard = from_hazard if to_r == bottom_r else to_hazard
-                if top_is_hazard:
-                    return True
-                y = min(wall_y - 2, ma.shape[0] - 1)
-                return bool(ma[y, x])
-            else:
-                y_top    = min(wall_y - 1, ma.shape[0] - 1)
-                y_bottom = min(wall_y + 1, ma.shape[0] - 1)
-                return bool(ma[y_top, x]) and bool(ma[y_bottom, x])
+            y_top    = min(wall_y - 1, ma.shape[0] - 1)
+            y_bottom = min(wall_y + 1, ma.shape[0] - 1)
+            return bool(ma[y_top, x]) and bool(ma[y_bottom, x])
 
     def step(self, actions: List[Action]) -> TurnResult:
         if not actions or len(actions) > 5:

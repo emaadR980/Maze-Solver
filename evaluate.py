@@ -18,6 +18,7 @@ agent.env = env
 
 agent.known = {}
 agent.wall_edges = set()
+agent.open_edges = set()
 
 episode_results = []
 

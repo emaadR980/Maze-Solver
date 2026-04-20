@@ -62,7 +62,7 @@ class LiveVisualizer:
         self._title       = title
         self._last_paint_idx = 0
 
-        self._painted: Image.Image = env.loader.img.copy().convert("RGB")
+        self._painted: Image.Image = self._fresh_base_image()
 
         plt.ion()
         self.fig, self.ax = plt.subplots(figsize=(8, 8))
@@ -85,8 +85,26 @@ class LiveVisualizer:
     def reset_episode(self, env=None) -> None:
         if env:
             self.env = env
-        self._painted = self.env.loader.img.copy().convert("RGB")
+        self._painted = self._fresh_base_image()
         self._last_paint_idx = 0
+
+    def _fresh_base_image(self) -> Image.Image:
+        img = self.env.loader.img.copy().convert("RGB")
+        if getattr(self.env, "rotate_fire_enabled", False):
+            draw = ImageDraw.Draw(img)
+            cell = self.env.CELL_SIZE
+            fire_cells = set()
+            for cluster in getattr(self.env, "initial_fire_clusters", self.env.fire_clusters):
+                for r, c in cluster:
+                    if self.env.is_cell_in_bounds(r, c):
+                        fire_cells.add((r, c))
+            for r, c in fire_cells:
+                x0 = c * cell + 2
+                y0 = r * cell + 2
+                x1 = (c + 1) * cell - 2
+                y1 = (r + 1) * cell - 2
+                draw.rectangle([x0, y0, x1, y1], fill=(255, 255, 255))
+        return img
 
     def update(
         self,
@@ -109,18 +127,21 @@ class LiveVisualizer:
         _draw_path(draw, self.env, new_segment)
         self._last_paint_idx = len(path)
 
-        for (r, c), ct in known.items():
-            col = _HAZARD_COLOUR.get(ct)
-            if col:
-                _dot(draw, _cell_centre(self.env, r, c), col, r=_DOT_R + 1)
-
-        if start_pos:
-            _dot(draw, _cell_centre(self.env, *start_pos), _START_COLOUR, r=5)
-        if goal_pos:
-            _dot(draw, _cell_centre(self.env, *goal_pos), _GOAL_COLOUR, r=6)
-
         display = self._painted.copy()
         disp_draw = ImageDraw.Draw(display)
+
+        for (r, c), ct in known.items():
+            if ct == 'death' and getattr(self.env, "rotate_fire_enabled", False):
+                continue
+            col = _HAZARD_COLOUR.get(ct)
+            if col:
+                _dot(disp_draw, _cell_centre(self.env, r, c), col, r=_DOT_R + 1)
+
+        if start_pos:
+            _dot(disp_draw, _cell_centre(self.env, *start_pos), _START_COLOUR, r=5)
+        if goal_pos:
+            _dot(disp_draw, _cell_centre(self.env, *goal_pos), _GOAL_COLOUR, r=6)
+
         rotating = set()
         for cl in self.env.fire_clusters:
             rotating.update(cl)
