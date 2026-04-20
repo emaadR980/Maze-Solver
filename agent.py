@@ -1,5 +1,6 @@
 from hazardDemo import Action, TurnResult
 from collections import defaultdict, deque
+import heapq
 import random, pickle
 from typing import List, Optional, Tuple
 
@@ -175,7 +176,12 @@ class MazeAgent:
             self._planned_path = []
             self.confused_turns_left = 0
             self._stagnation_turns = 0
-            self._respawn_wait_turns = 5 if self.env is not None and self.env.death_pits else random.randint(1, 4)
+            # Avoid phase-locking with rotating fire cycles.
+            # A fixed 5-turn wait repeats the exact same fire phase and can cause infinite death loops.
+            if self.env is not None and self.env.rotate_fire_enabled:
+                self._respawn_wait_turns = random.randint(1, 4)
+            else:
+                self._respawn_wait_turns = random.randint(1, 2)
             # Respawn at start
             if self.start_pos is not None:
                 self.current_pos = self.start_pos
@@ -318,17 +324,21 @@ class MazeAgent:
         turns_in_cycle_start = env.turn_count % 5
         start_state = (start_pos[0], start_pos[1], 0, turns_in_cycle_start)
         parent = {start_state: None}
-        queue = deque([start_state])
+        best_cost = {start_state: 0.0}
+        pq = [(self._goal_heuristic(start_pos, goal), 0.0, start_state)]
 
         found = None
         max_expansions = 120000
         expansions = 0
 
-        while queue and expansions < max_expansions:
+        while pq and expansions < max_expansions:
             expansions += 1
-            r, c, phase, turns_in_cycle = queue.popleft()
+            _, cost_so_far, state = heapq.heappop(pq)
+            if cost_so_far != best_cost.get(state):
+                continue
+            r, c, phase, turns_in_cycle = state
             if (r, c) == goal:
-                found = (r, c, phase, turns_in_cycle)
+                found = state
                 break
 
             for intended in (*MOVE_ACTIONS, Action.WAIT):
@@ -351,11 +361,28 @@ class MazeAgent:
 
                 next_turns = (turns_in_cycle + 1) % 5
                 next_phase = (phase + 1) % 4 if next_turns == 0 else phase
-                nxt_state = (nr, nc, next_phase, next_turns)
-                if nxt_state in parent:
+
+                # Fire rotates after every 5th turn, and the environment can kill
+                # the agent immediately if the rotated pit lands on its position.
+                if next_turns == 0 and (nr, nc) in phase_deaths[next_phase]:
                     continue
+
+                nxt_state = (nr, nc, next_phase, next_turns)
+                transition_cost = 1.0 + self._dynamic_risk_cost(
+                    current=(r, c),
+                    nxt=(nr, nc),
+                    intended=intended,
+                    phase=phase,
+                    next_phase=next_phase,
+                    phase_deaths=phase_deaths,
+                )
+                new_cost = cost_so_far + transition_cost
+                if new_cost >= best_cost.get(nxt_state, float('inf')):
+                    continue
+                best_cost[nxt_state] = new_cost
                 parent[nxt_state] = ((r, c, phase, turns_in_cycle), intended)
-                queue.append(nxt_state)
+                priority = new_cost + self._goal_heuristic((nr, nc), goal)
+                heapq.heappush(pq, (priority, new_cost, nxt_state))
 
         if found is None:
             return []
@@ -368,6 +395,56 @@ class MazeAgent:
             node = prev
         actions.reverse()
         return actions
+
+    def _goal_heuristic(self, pos: Tuple[int, int], goal: Tuple[int, int]) -> float:
+        return abs(pos[0] - goal[0]) + abs(pos[1] - goal[1])
+
+    def _dynamic_risk_cost(
+        self,
+        current: Tuple[int, int],
+        nxt: Tuple[int, int],
+        intended: Action,
+        phase: int,
+        next_phase: int,
+        phase_deaths: List[set],
+    ) -> float:
+        """Soft penalties for routes that are safe but likely to lead to bad fire timing."""
+        risk = 0.0
+
+        if intended is Action.WAIT:
+            risk += 4.0
+
+        risk += 0.15 * self.visit_count.get(nxt, 0)
+
+        current_pits = phase_deaths[phase]
+        next_pits = phase_deaths[next_phase]
+
+        def manhattan_to_nearest(cell: Tuple[int, int], pits: set) -> Optional[int]:
+            if not pits:
+                return None
+            return min(abs(cell[0] - pr) + abs(cell[1] - pc) for pr, pc in pits)
+
+        dist_now = manhattan_to_nearest(nxt, current_pits)
+        dist_next = manhattan_to_nearest(nxt, next_pits)
+
+        if dist_now is not None:
+            if dist_now == 1:
+                risk += 6.0
+            elif dist_now == 2:
+                risk += 2.5
+
+        if dist_next is not None:
+            if dist_next == 0:
+                risk += 1000.0
+            elif dist_next == 1:
+                risk += 10.0
+            elif dist_next == 2:
+                risk += 4.0
+
+        if nxt == current:
+            risk += 2.0
+
+        return risk
 
 
 
