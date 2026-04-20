@@ -61,8 +61,7 @@ class MazeAgent:
         self.visit_count    = defaultdict(int)
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
         self.episode += 1
-        self.known = {pos: ct for pos, ct in self.known.items()
-                      if ct == 'empty'}
+        self.known = dict(self.known)
 
     def plan_turn(self, last_result: Optional[TurnResult]) -> List[Action]:
         if last_result is not None:
@@ -202,11 +201,22 @@ class MazeAgent:
         if result.is_confused:
             self.known[self.current_pos] = 'confusion'
         elif result.teleported:
-            if len(self._last_actions) == 1 and self._prev_pos is not None:
-                dr, dc = DELTAS[_actual(self._last_actions[0])]
-                src_pad = (self._prev_pos[0]+dr, self._prev_pos[1]+dc)
-                self.known[src_pad] = 'teleport'
-            self.known[self.current_pos] = 'teleport'
+            # Label the teleport pad we stepped onto — regardless of batch size,
+            # it's the cell one step from _prev_pos in the direction of the first action
+            # that caused teleportation. Since we can't know which action in a batch
+            # triggered it, label all candidate cells in the batch path.
+            if self._prev_pos is not None:
+                pos = self._prev_pos
+                for act in self._last_actions:
+                    dr, dc = DELTAS[_actual(act)]
+                    candidate = (pos[0] + dr, pos[1] + dc)
+                    if self.env is not None and candidate in self.env.teleport_map:
+                        self.known[candidate] = 'teleport'
+                        break
+                    pos = candidate
+
+            if self.known.get(self.current_pos) not in ('death', 'confusion'):
+                self.known[self.current_pos] = 'empty'
         else:
             if self.known.get(self.current_pos) not in ('death', 'confusion', 'teleport'):
                 self.known[self.current_pos] = 'empty'

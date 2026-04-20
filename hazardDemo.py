@@ -83,25 +83,43 @@ class MazeEnvironment:
         self.initial_fire_clusters = [list(cluster) for cluster in self.fire_clusters]
         self.confusion_pads = set(map(tuple, self.loader.confusion_pads))
 
-        all_hazard_cells = (
-            self.death_pits
-            | self.confusion_pads
-            | set(map(tuple, self.loader.teleport_purple))
-            | set(map(tuple, self.loader.teleport_orange))
-            | set(map(tuple, self.loader.teleport_green))
-            | set(map(tuple, self.loader.teleport_red))
-        )
+        self.teleport_pads = {
+            "purple": set(map(tuple, self.loader.teleport_purple_pads)),
+            "orange": set(map(tuple, self.loader.teleport_orange_pads)),
+            "green":  set(map(tuple, self.loader.teleport_green_pads)),
+            "red":    set(map(tuple, self.loader.teleport_red_pads)),
+        }
+
+        self.teleport_dests = {
+            "purple": set(map(tuple, self.loader.teleport_purple_dests)),
+            "orange": set(map(tuple, self.loader.teleport_orange_dests)),
+            "green":  set(map(tuple, self.loader.teleport_green_dests)),
+            "red":    set(map(tuple, self.loader.teleport_red_dests)),
+        }
+
+        all_hazard_cells = self.death_pits | self.confusion_pads
+        for color in self.teleport_pads:
+            all_hazard_cells |= self.teleport_pads[color]
+
         for r, c in all_hazard_cells:
             self.grid[r][c] = True
 
         self.teleport_map: dict = {}
-        for group in [self.loader.teleport_purple, self.loader.teleport_orange, self.loader.teleport_green, self.loader.teleport_red]:
-            pads = [tuple(p) for p in group]
-            for i in range(0, len(pads) - 1, 2):
-                self.teleport_map[pads[i]]     = pads[i + 1]
-                self.teleport_map[pads[i + 1]] = pads[i]
-            if len(pads) % 2 == 1:          # unpaired pad → maps to itself (no-op)
-                self.teleport_map[pads[-1]] = pads[-1]
+
+        for color in ("purple", "orange", "green", "red"):
+            pads = sorted(self.teleport_pads[color])
+            dests = sorted(self.teleport_dests[color])
+
+            if len(pads) > 0 and len(dests) != 1:
+                raise ValueError(
+                    f"Expected exactly 1 destination for teleport color '{color}', "
+                    f"but found {len(dests)} destinations."
+                )
+
+            if len(dests) == 1:
+                dest = next(iter(dests))
+                for pad in pads:
+                    self.teleport_map[pad] = dest
 
         # episode state
         self.agent_pos: Tuple[int, int] = self.start_cell
@@ -235,53 +253,39 @@ class MazeEnvironment:
             return False
         return self.grid[row][col]
 
-    def is_move_passable(self, from_r: int, from_c: int, to_r: int, to_c: int,
-                         from_hazard: bool = False, to_hazard: bool = False) -> bool:
+    def is_move_passable(self, from_r: int, from_c: int, to_r: int, to_c: int, from_hazard: bool = False, to_hazard: bool = False,) -> bool:
         h = self.loader.maze_height_cells
         w = self.loader.maze_width_cells
         if not (0 <= to_r < h and 0 <= to_c < w):
             return False
-        ma    = self.loader.maze_array
-        CELL  = self.CELL_SIZE
+
+        ma = self.loader.maze_array
+        CELL = self.CELL_SIZE
         BORDER = 1
 
         dr = to_r - from_r
+        dc = to_c - from_c
 
-        if dr == 0:  # horizontal
+        if abs(dr) + abs(dc) != 1:
+            return False
+
+        if dr == 0:  # horizontal move
             right_c = max(from_c, to_c)
-            right_is_hazard = to_hazard if to_c == right_c else from_hazard
-
             wall_x = right_c * CELL + BORDER
             y = min(from_r * CELL + CELL // 2 + BORDER, ma.shape[0] - 1)
 
-            if right_is_hazard:
-                left_is_hazard = from_hazard if to_c == right_c else to_hazard
-                if left_is_hazard:
-                    return True
-                x = min(wall_x - 2, ma.shape[1] - 1)
-                return bool(ma[y, x])
-            else:
-                x_left  = min(wall_x - 1, ma.shape[1] - 1)
-                x_right = min(wall_x + 1, ma.shape[1] - 1)
-                return bool(ma[y, x_left]) and bool(ma[y, x_right])
+            x_left = min(wall_x - 1, ma.shape[1] - 1)
+            x_right = min(wall_x + 1, ma.shape[1] - 1)
+            return bool(ma[y, x_left]) and bool(ma[y, x_right])
 
-        else:  # vertical
+        else:  # vertical move
             bottom_r = max(from_r, to_r)
-            bottom_is_hazard = to_hazard if to_r == bottom_r else from_hazard
-
             wall_y = bottom_r * CELL + BORDER
             x = min(from_c * CELL + CELL // 2 + BORDER, ma.shape[1] - 1)
 
-            if bottom_is_hazard:
-                top_is_hazard = from_hazard if to_r == bottom_r else to_hazard
-                if top_is_hazard:
-                    return True
-                y = min(wall_y - 2, ma.shape[0] - 1)
-                return bool(ma[y, x])
-            else:
-                y_top    = min(wall_y - 1, ma.shape[0] - 1)
-                y_bottom = min(wall_y + 1, ma.shape[0] - 1)
-                return bool(ma[y_top, x]) and bool(ma[y_bottom, x])
+            y_top = min(wall_y - 1, ma.shape[0] - 1)
+            y_bottom = min(wall_y + 1, ma.shape[0] - 1)
+            return bool(ma[y_top, x]) and bool(ma[y_bottom, x])
 
     def step(self, actions: List[Action]) -> TurnResult:
         if not actions or len(actions) > 5:
@@ -324,6 +328,7 @@ class MazeEnvironment:
                 self.agent_pos = dest
                 result.teleported = True
                 result.current_position = self.agent_pos
+                result.positions_visited.append(dest)
                 result.last_event = f"TELEPORT {src}->{dest}"
                 self.teleport_count += 1
 
@@ -640,12 +645,14 @@ class DemoAgent:
         if self.env.teleport_map:
             self.env.agent_pos = self.env.start_cell
             self.env.confused_turns_left = 0
+
             teleport_pads = set(self.env.teleport_map.keys())
             src = None
             dst = None
             src_adj = None
             src_action = None
             repositioned = False
+
             for candidate in teleport_pads:
                 candidate_dst = self.env.teleport_map[candidate]
                 candidate_avoid = self.env.death_pits | self.env.confusion_pads | (teleport_pads - {candidate})
@@ -654,6 +661,7 @@ class DemoAgent:
                     src, src_adj, src_action = probe
                     dst = candidate_dst
                     break
+
             if src is None:
                 for candidate in teleport_pads:
                     probe = self.find_any_probe([candidate])
@@ -662,14 +670,17 @@ class DemoAgent:
                         dst = self.env.teleport_map[candidate]
                         repositioned = True
                         break
+
             if src is None:
                 print("No reachable teleport pads detected.\n")
             else:
                 print(f"Teleport Pad @ cell {src} -> dest {dst}")
                 print(f"  Expected : teleported=True, position jumps to {dst}")
+
                 if repositioned:
                     self.env.agent_pos = src_adj
                     print(f"  Repositioned next to pad at {src_adj} for direct verification")
+
                 teleport_avoid = self.env.death_pits | self.env.confusion_pads | (teleport_pads - {src})
                 self.env.freeze_fire = True
                 if repositioned:
@@ -677,11 +688,12 @@ class DemoAgent:
                 else:
                     result = self.step_onto(src, avoid=teleport_avoid)
                 self.env.freeze_fire = False
+
                 print(f"  Result   : {result}")
                 ok = "ok" if result.teleported else "nope"
                 match_ok = "ok" if self.env.agent_pos == dst else "nope"
                 print(f"  teleported={result.teleported} {ok}  /  "
-                      f"landed at {self.env.agent_pos}  expected {dst} {match_ok}")
+                    f"landed at {self.env.agent_pos}  expected {dst} {match_ok}")
                 print()
         else:
             print("No teleport pads detected.\n")

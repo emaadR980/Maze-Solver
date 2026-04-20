@@ -24,6 +24,20 @@ for ep in range(MAX_EPISODES):
         old_state = agent.state()
 
         actions = agent.plan_turn(last_result)
+        # debug to see why getting timeouts over and over
+        if ep == 2 and turn % 1000 == 0:
+            frontier = agent._frontier_target()
+            plan = agent._make_plan()
+            tp_pads = len(agent.env.teleport_map) if agent.env else 0
+            known_tp = sum(1 for v in agent.known.values() if v == 'teleport')
+            unlabeled = [pad for pad in agent.env.teleport_map if agent.known.get(pad) != 'teleport']
+            print(f"  [dbg] unlabeled tp pads: {unlabeled}")
+            print(f"  [dbg] teleport_map: {agent.env.teleport_map}")
+            print(f"  [dbg t={turn}] pos={agent.current_pos} "
+                  f"frontier={frontier} plan={len(plan)} "
+                  f"stag={agent._stagnation_turns} confused={agent.confused_turns_left} "
+                  f"wall_edges={len(agent.wall_edges)//2} known={len(agent.known)}"
+                  f"known_tp={known_tp}/{tp_pads}")
         result  = env.step(actions)
 
         reward    = agent.compute_reward(result, old_pos)

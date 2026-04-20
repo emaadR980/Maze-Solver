@@ -95,7 +95,22 @@ class CvTemplateHazards:
 
 # load templates from ./templates directory
 def load_templates_from_dir(template_dir="templates"):
-    labels = ["confusion", "death_pit", "teleport_orange", "teleport_green", "teleport_purple", "teleport_red"]
+    labels = [
+        "confusion",
+        "death_pit",
+
+        "teleport_orange_pad",
+        "teleport_orange_dest",
+
+        "teleport_green_pad",
+        "teleport_green_dest",
+
+        "teleport_purple_pad",
+        "teleport_purple_dest",
+
+        "teleport_red_pad",
+        "teleport_red_dest",
+    ]
     templates_by_label = {}
 
     for lab in labels:
@@ -140,10 +155,18 @@ class MazeLoader:
 
         self.death_pits = []
         self.confusion_pads = []
-        self.teleport_purple = []
-        self.teleport_orange = []
-        self.teleport_green = []
-        self.teleport_red = []
+        
+        self.teleport_purple_pads = []
+        self.teleport_purple_dests = []
+
+        self.teleport_orange_pads = []
+        self.teleport_orange_dests = []
+
+        self.teleport_green_pads = []
+        self.teleport_green_dests = []
+
+        self.teleport_red_pads = []
+        self.teleport_red_dests = []
 
         self.bgr = cv2.cvtColor(self.rgb_array, cv2.COLOR_RGB2BGR)
 
@@ -267,14 +290,25 @@ class MazeLoader:
                     self.death_pits.append((r, c))
                 elif lab == "confusion":
                     self.confusion_pads.append((r, c))
-                elif lab == "teleport_purple":
-                    self.teleport_purple.append((r, c))
-                elif lab == "teleport_orange":
-                    self.teleport_orange.append((r, c))
-                elif lab == "teleport_green":
-                    self.teleport_green.append((r, c))
-                elif lab == "teleport_red":
-                    self.teleport_red.append((r, c))
+                elif lab == "teleport_purple_pad":
+                    self.teleport_purple_pads.append((r, c))
+                elif lab == "teleport_purple_dest":
+                    self.teleport_purple_dests.append((r, c))
+
+                elif lab == "teleport_orange_pad":
+                    self.teleport_orange_pads.append((r, c))
+                elif lab == "teleport_orange_dest":
+                    self.teleport_orange_dests.append((r, c))
+
+                elif lab == "teleport_green_pad":
+                    self.teleport_green_pads.append((r, c))
+                elif lab == "teleport_green_dest":
+                    self.teleport_green_dests.append((r, c))
+
+                elif lab == "teleport_red_pad":
+                    self.teleport_red_pads.append((r, c))
+                elif lab == "teleport_red_dest":
+                    self.teleport_red_dests.append((r, c))
 
         print(f"Found {detected} hazardous cells")
         return self.get_hazard_summary()
@@ -283,10 +317,19 @@ class MazeLoader:
         return {
             "death_pits": len(self.death_pits),
             "confusion": len(self.confusion_pads),
-            "teleport_purple": len(self.teleport_purple),
-            "teleport_orange": len(self.teleport_orange),
-            "teleport_green": len(self.teleport_green),
-            "teleport_red": len(self.teleport_red),
+
+            "teleport_purple_pads": len(self.teleport_purple_pads),
+            "teleport_purple_dests": len(self.teleport_purple_dests),
+
+            "teleport_orange_pads": len(self.teleport_orange_pads),
+            "teleport_orange_dests": len(self.teleport_orange_dests),
+
+            "teleport_green_pads": len(self.teleport_green_pads),
+            "teleport_green_dests": len(self.teleport_green_dests),
+
+            "teleport_red_pads": len(self.teleport_red_pads),
+            "teleport_red_dests": len(self.teleport_red_dests),
+
             "start_pos": self.start_pos,
             "goal_pos": self.goal_pos,
         }
@@ -325,7 +368,7 @@ class MazeLoader:
                     if 0 <= ny < self.h and 0 <= nx < self.w:
                         pixels[nx, ny] = (255, 255, 0)
 
-        for r, c in self.teleport_purple:
+        for r, c in self.teleport_purple_pads:
             py, px = self.cell_to_pixel(r, c)
             for dy in range(-marker, marker + 1):
                 for dx in range(-marker, marker + 1):
@@ -333,7 +376,15 @@ class MazeLoader:
                     if 0 <= ny < self.h and 0 <= nx < self.w:
                         pixels[nx, ny] = (128, 0, 255)
 
-        for r, c in self.teleport_orange:
+        for r, c in self.teleport_purple_dests:
+            py, px = self.cell_to_pixel(r, c)
+            for dy in range(-marker, marker + 1):
+                for dx in range(-marker, marker + 1):
+                    ny, nx = py + dy, px + dx
+                    if 0 <= ny < self.h and 0 <= nx < self.w:
+                        pixels[nx, ny] = (200, 100, 255)
+
+        for r, c in self.teleport_orange_pads:
             py, px = self.cell_to_pixel(r, c)
             for dy in range(-marker, marker + 1):
                 for dx in range(-marker, marker + 1):
@@ -341,7 +392,15 @@ class MazeLoader:
                     if 0 <= ny < self.h and 0 <= nx < self.w:
                         pixels[nx, ny] = (255, 140, 0)
 
-        for r, c in self.teleport_green:
+        for r, c in self.teleport_orange_dests:
+            py, px = self.cell_to_pixel(r, c)
+            for dy in range(-marker, marker + 1):
+                for dx in range(-marker, marker + 1):
+                    ny, nx = py + dy, px + dx
+                    if 0 <= ny < self.h and 0 <= nx < self.w:
+                        pixels[nx, ny] = (255, 200, 120)
+
+        for r, c in self.teleport_green_pads:
             py, px = self.cell_to_pixel(r, c)
             for dy in range(-marker, marker + 1):
                 for dx in range(-marker, marker + 1):
@@ -349,13 +408,29 @@ class MazeLoader:
                     if 0 <= ny < self.h and 0 <= nx < self.w:
                         pixels[nx, ny] = (0, 255, 0)
 
-        for r, c in self.teleport_red:
+        for r, c in self.teleport_green_dests:
+            py, px = self.cell_to_pixel(r, c)
+            for dy in range(-marker, marker + 1):
+                for dx in range(-marker, marker + 1):
+                    ny, nx = py + dy, px + dx
+                    if 0 <= ny < self.h and 0 <= nx < self.w:
+                        pixels[nx, ny] = (120, 255, 120)
+
+        for r, c in self.teleport_red_pads:
             py, px = self.cell_to_pixel(r, c)
             for dy in range(-marker, marker + 1):
                 for dx in range(-marker, marker + 1):
                     ny, nx = py + dy, px + dx
                     if 0 <= ny < self.h and 0 <= nx < self.w:
                         pixels[nx, ny] = (220, 0, 255)
+
+        for r, c in self.teleport_red_dests:
+            py, px = self.cell_to_pixel(r, c)
+            for dy in range(-marker, marker + 1):
+                for dx in range(-marker, marker + 1):
+                    ny, nx = py + dy, px + dx
+                    if 0 <= ny < self.h and 0 <= nx < self.w:
+                        pixels[nx, ny] = (255, 120, 255)
 
         for pos in [self.start_pos, self.goal_pos]:
             if not pos:
@@ -415,13 +490,32 @@ def main():
     print("\nHazard results:")
     print(f"- Death pits: {summary['death_pits']}")
     print(f"- Confusion pads: {summary['confusion']}")
-    print(f"- Purple teleports: {summary['teleport_purple']}")
-    print(f"- Orange teleports: {summary['teleport_orange']}")
-    print(f"- Green teleports: {summary['teleport_green']}")
-    print(f"- Red teleports: {summary['teleport_red']}")
 
-    total = (summary["death_pits"] + summary["confusion"] + summary["teleport_purple"] + summary["teleport_orange"] + summary["teleport_green"] + summary["teleport_red"])
-    print(f"Total hazardous cells: {total}")
+    print(f"- Purple teleport pads: {summary['teleport_purple_pads']}")
+    print(f"- Purple teleport destinations: {summary['teleport_purple_dests']}")
+
+    print(f"- Orange teleport pads: {summary['teleport_orange_pads']}")
+    print(f"- Orange teleport destinations: {summary['teleport_orange_dests']}")
+
+    print(f"- Green teleport pads: {summary['teleport_green_pads']}")
+    print(f"- Green teleport destinations: {summary['teleport_green_dests']}")
+
+    print(f"- Red teleport pads: {summary['teleport_red_pads']}")
+    print(f"- Red teleport destinations: {summary['teleport_red_dests']}")
+
+    total = (
+        summary["death_pits"]
+        + summary["confusion"]
+        + summary["teleport_purple_pads"]
+        + summary["teleport_purple_dests"]
+        + summary["teleport_orange_pads"]
+        + summary["teleport_orange_dests"]
+        + summary["teleport_green_pads"]
+        + summary["teleport_green_dests"]
+        + summary["teleport_red_pads"]
+        + summary["teleport_red_dests"]
+    )
+    print(f"Total detected hazard cells: {total}")
 
     loader.visualize_hazards("maze_detected_hazards.png", base_image_path=maze_path)
 
