@@ -241,47 +241,69 @@ class MazeEnvironment:
         w = self.loader.maze_width_cells
         if not (0 <= to_r < h and 0 <= to_c < w):
             return False
+
+        # Hazard cells (teleport / confusion / fire) contain emoji pixels that
+        # darken their interior, so we must not use the interior pixel of a hazard
+        # cell to judge whether a wall exists there.  Instead only check the pixel
+        # on the NON-hazard side of the shared boundary.
+        from_is_hazard = from_hazard or (from_r, from_c) in self.death_pits \
+            or (from_r, from_c) in self.confusion_pads \
+            or (from_r, from_c) in self.teleport_map
+        to_is_hazard   = to_hazard   or (to_r,   to_c)   in self.death_pits \
+            or (to_r,   to_c)   in self.confusion_pads \
+            or (to_r,   to_c)   in self.teleport_map
+
         ma    = self.loader.maze_array
         CELL  = self.CELL_SIZE
         BORDER = 1
 
         dr = to_r - from_r
 
-        if dr == 0:  # horizontal
-            right_c = max(from_c, to_c)
-            right_is_hazard = to_hazard if to_c == right_c else from_hazard
-
-            wall_x = right_c * CELL + BORDER
+        if dr == 0:  # horizontal move
+            wall_x = max(from_c, to_c) * CELL + BORDER
             y = min(from_r * CELL + CELL // 2 + BORDER, ma.shape[0] - 1)
-
-            if right_is_hazard:
-                left_is_hazard = from_hazard if to_c == right_c else to_hazard
-                if left_is_hazard:
-                    return True
-                x = min(wall_x - 2, ma.shape[1] - 1)
-                return bool(ma[y, x])
+            # x_left  = pixel inside from-cell;  x_right = pixel inside to-cell
+            x_left  = min(wall_x - 1, ma.shape[1] - 1)
+            x_right = min(wall_x + 1, ma.shape[1] - 1)
+            # If moving right, x_left is from-cell side, x_right is to-cell side
+            if from_c < to_c:
+                from_px, to_px = x_left, x_right
             else:
-                x_left  = min(wall_x - 1, ma.shape[1] - 1)
-                x_right = min(wall_x + 1, ma.shape[1] - 1)
-                return bool(ma[y, x_left]) and bool(ma[y, x_right])
+                from_px, to_px = x_right, x_left
+            check_from = (not from_is_hazard)
+            check_to   = (not to_is_hazard)
+            if check_from and not bool(ma[y, from_px]):
+                return False
+            if check_to and not bool(ma[y, to_px]):
+                return False
+            # If both sides are hazards we can't tell – assume passable unless
+            # the exact boundary pixel (wall_x) is dark.
+            if not check_from and not check_to:
+                bx = min(wall_x, ma.shape[1] - 1)
+                return bool(ma[y, bx])
+            return True
 
-        else:  # vertical
-            bottom_r = max(from_r, to_r)
-            bottom_is_hazard = to_hazard if to_r == bottom_r else from_hazard
-
-            wall_y = bottom_r * CELL + BORDER
+        else:  # vertical move
+            wall_y = max(from_r, to_r) * CELL + BORDER
             x = min(from_c * CELL + CELL // 2 + BORDER, ma.shape[1] - 1)
-
-            if bottom_is_hazard:
-                top_is_hazard = from_hazard if to_r == bottom_r else to_hazard
-                if top_is_hazard:
-                    return True
-                y = min(wall_y - 2, ma.shape[0] - 1)
-                return bool(ma[y, x])
+            # y_top = pixel inside upper cell; y_bottom = pixel inside lower cell
+            y_top    = min(wall_y - 1, ma.shape[0] - 1)
+            y_bottom = min(wall_y + 1, ma.shape[0] - 1)
+            # If moving down, from-cell is y_top side, to-cell is y_bottom side
+            if from_r < to_r:
+                from_py, to_py = y_top, y_bottom
             else:
-                y_top    = min(wall_y - 1, ma.shape[0] - 1)
-                y_bottom = min(wall_y + 1, ma.shape[0] - 1)
-                return bool(ma[y_top, x]) and bool(ma[y_bottom, x])
+                from_py, to_py = y_bottom, y_top
+            check_from = (not from_is_hazard)
+            check_to   = (not to_is_hazard)
+            if check_from and not bool(ma[from_py, x]):
+                return False
+            if check_to and not bool(ma[to_py, x]):
+                return False
+            if not check_from and not check_to:
+                by = min(wall_y, ma.shape[0] - 1)
+                return bool(ma[by, x])
+            return True
 
     def step(self, actions: List[Action]) -> TurnResult:
         if not actions or len(actions) > 5:
