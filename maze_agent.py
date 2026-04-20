@@ -1,69 +1,69 @@
+#maze_agent.py
 """
 maze_agent.py
 Silent Cartographer: Maze Navigation Project — COSC 4368 AI Spring 2026
 
-Neuroevolution agent.  START_CELL / GOAL_CELL are set at runtime from the
-real MazeEnvironment so they always match the image being used.
+Trained on ONE maze, designed to generalize to unseen mazes.
 
-Two-phase training
-──────────────────
-  EXPLORE  (default)  — reward broad exploration and approaching the goal.
-                         Deaths / wall hits penalised lightly so the agent is
-                         not afraid to probe unknown territory.
-  OPTIMIZE            — triggered automatically once enough cumulative
-                         individuals have solved the maze.  Fitness is almost
-                         entirely determined by *whether* the goal was reached
-                         and *how cleanly* (turns, deaths, wall hits).
-                         Agents that don't reach the goal score near-zero so
-                         selection pressure is entirely on efficiency.
+Generalization design
+─────────────────────
+  • State: local observations + goal direction only — no global map dependency.
+  • Progress signals (stall, revisit pressure) guide recovery without
+    memorizing specific corridors.
+  • Local structure features (dead-end, corridor, open count) teach primitives
+    that transfer across layouts.
+  • Random immigrants each generation prevent premature convergence.
+  • Phase regression: if solvers drop to 0, revert to EXPLORE to rebuild gradient.
 """
 
 from __future__ import annotations
 import numpy as np
 import random
-import pickle
-import argparse
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import List, Tuple, Dict, Optional
 
 from environment import Action, TurnResult, MazeEnvironment
 
-# ── Runtime-configurable maze constants (set by live_viz / main) ──────────────
+# ── Runtime-configurable maze constants ───────────────────────────────────────
 GRID_SIZE  = 64
-START_CELL = (0,  0)    # overwritten by configure()
-GOAL_CELL  = (63, 63)   # overwritten by configure()
+START_CELL = (0,  0)
+GOAL_KNOWN = False
 
-DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-ACTION_MAP  = [Action.MOVE_UP, Action.MOVE_DOWN, Action.MOVE_LEFT, Action.MOVE_RIGHT,
-               Action.WAIT]   # WAIT added — 5th output of the neural net
-MOVE_ACTIONS = ACTION_MAP[:4] # directional subset for wall/BFS logic
-INVERT_MAP  = {
+DIRECTIONS   = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+ACTION_MAP   = [Action.MOVE_UP, Action.MOVE_DOWN, Action.MOVE_LEFT,
+                Action.MOVE_RIGHT, Action.WAIT]
+MOVE_ACTIONS = ACTION_MAP[:4]
+INVERT_MAP   = {
     Action.MOVE_UP:    Action.MOVE_DOWN,
     Action.MOVE_DOWN:  Action.MOVE_UP,
     Action.MOVE_LEFT:  Action.MOVE_RIGHT,
     Action.MOVE_RIGHT: Action.MOVE_LEFT,
-    Action.WAIT:       Action.WAIT,     # wait is symmetric under confusion
+    Action.WAIT:       Action.WAIT,
 }
 
-# ── Training phases ───────────────────────────────────────────────────────────
 PHASE_EXPLORE  = "explore"
 PHASE_OPTIMIZE = "optimize"
+MAX_FIRE_WAIT  = 2  # max turns to wait for rotating fire to clear
+
+def set_goal_known(v: bool = True):
+    global GOAL_KNOWN
+    GOAL_KNOWN = v
 
 def configure(start: Tuple[int,int], goal: Tuple[int,int], grid_size: int = 64):
-    """Call once after creating the environment."""
     global START_CELL, GOAL_CELL, GRID_SIZE
     START_CELL = start
     GOAL_CELL  = goal
     GRID_SIZE  = grid_size
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Neural Network Controller
 # ─────────────────────────────────────────────────────────────────────────────
 class NeuralController:
-    # 31 inputs: pos(2) + goal(3) + 4dirs×4(16) + fire_timer(1) + 4dirs×tp_benefit(4) + misc(5)
+    # 39 inputs — see StateEncoder for full breakdown
     # 5 outputs: UP DOWN LEFT RIGHT WAIT
-    DEFAULT_LAYERS = [31, 64, 32, 5]
+    DEFAULT_LAYERS = [37, 64, 32, 5]
 
     def __init__(self, layer_sizes: List[int] = None):
         self.layer_sizes = layer_sizes or self.DEFAULT_LAYERS
@@ -88,7 +88,8 @@ class NeuralController:
                 x = np.maximum(0.0, x)
         x = x - x.max()
         e = np.exp(x)
-        return e / e.sum()
+        s = e.sum()
+        return e / s if s > 0 else np.ones_like(e) / len(e)
 
     def get_flat_weights(self) -> np.ndarray:
         return np.concatenate(
@@ -99,17 +100,16 @@ class NeuralController:
         idx = 0
         for i in range(len(self.weights)):
             sz = self.weights[i].size
-            self.weights[i] = flat[idx:idx + sz].reshape(self.weights[i].shape)
+            self.weights[i] = flat[idx:idx+sz].reshape(self.weights[i].shape)
             idx += sz
         for i in range(len(self.biases)):
             sz = self.biases[i].size
-            self.biases[i] = flat[idx:idx + sz].copy()
+            self.biases[i] = flat[idx:idx+sz].copy()
             idx += sz
 
     @property
     def num_params(self) -> int:
-        return (sum(w.size for w in self.weights) +
-                sum(b.size for b in self.biases))
+        return sum(w.size for w in self.weights) + sum(b.size for b in self.biases)
 
     def clone(self) -> "NeuralController":
         c = NeuralController(self.layer_sizes)
@@ -148,14 +148,38 @@ class AgentMemory:
             self.visit_count     = self._shared_visits
             self.known_teleports = self._shared_teleports
 
-        self.path:                List = []
-        self.is_confused:         bool = False
-        self.confused_turns_left: int  = 0
+        self.path:                          List = []
+        self.is_confused:                   bool = False
+        self.confused_turns_left:           int  = 0
+        # Progress signals used by StateEncoder
+        self.turns_since_new_cell:          int  = 0
+        self.turns_since_dist_decrease:     int  = 0
+        self.last_goal_dist:                int  = 9999
+        self.last_wall_hit:                 bool = False
 
-    def update(self, prev_pos, action, result: TurnResult, intended_action):
+    def update(self, prev_pos, action, result: TurnResult, intended_action,
+               goal_cell: Tuple[int,int] = None):
         new_pos = result.current_position
         self.path.append(new_pos)
+        self.last_wall_hit = result.wall_hits > 0
+
+        was_new = self.visit_count[new_pos] == 0
         self.visit_count[new_pos] += 1
+
+        if was_new:
+            self.turns_since_new_cell = 0
+        else:
+            self.turns_since_new_cell = min(self.turns_since_new_cell + 1, 100)
+
+        # Only track goal-distance progress once the goal has been discovered
+        if goal_cell is not None and GOAL_KNOWN:
+            d = abs(goal_cell[0] - new_pos[0]) + abs(goal_cell[1] - new_pos[1])
+            if d < self.last_goal_dist:
+                self.last_goal_dist = d
+                self.turns_since_dist_decrease = 0
+            else:
+                self.turns_since_dist_decrease = min(
+                    self.turns_since_dist_decrease + 1, 100)
 
         if result.is_confused:
             self.is_confused         = True
@@ -165,87 +189,97 @@ class AgentMemory:
             if self.confused_turns_left == 0:
                 self.is_confused = False
 
-        if (new_pos == prev_pos and
-                action not in (Action.WAIT,) and
-                not result.is_dead):
-            idx = ACTION_MAP.index(intended_action)
-            dr, dc = DIRECTIONS[idx]
-            self.known_walls.add((prev_pos[0], prev_pos[1], dr, dc))
+        if new_pos == prev_pos and action != Action.WAIT and not result.is_dead:
+            try:
+                idx = MOVE_ACTIONS.index(intended_action)
+                dr, dc = DIRECTIONS[idx]
+                self.known_walls.add((prev_pos[0], prev_pos[1], dr, dc))
+            except ValueError:
+                pass
 
         if result.is_dead and new_pos != prev_pos:
             self.known_pits.add(new_pos)
 
         if result.teleported:
             if new_pos == prev_pos:
-                # Teleporter loops back to source (or to an already-visited
-                # position with no escape).  Record the direction as a wall so
-                # the agent never tries it again — this breaks the infinite loop
-                # where the agent hammers the same teleporter forever.
-                idx = ACTION_MAP.index(intended_action)
-                dr, dc = DIRECTIONS[idx]
-                self.known_walls.add((prev_pos[0], prev_pos[1], dr, dc))
+                try:
+                    idx = MOVE_ACTIONS.index(intended_action)
+                    dr, dc = DIRECTIONS[idx]
+                    self.known_walls.add((prev_pos[0], prev_pos[1], dr, dc))
+                except ValueError:
+                    pass
             else:
                 self.known_teleports[prev_pos] = new_pos
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. State Encoder  (22 features)
+# 3. State Encoder  (39 features — all local / relative, no global map)
 #
-#   [0]   row / (gs-1)
-#   [1]   col / (gs-1)
-#   [2]   (goal_row - row) / (gs-1)       direction to goal
-#   [3]   (goal_col - col) / (gs-1)
-#   [4]   manhattan_dist / (2*(gs-1))
-#   [5-20] 4 dirs × (wall, known_pit, current_fire, visit)
-#   [21]  turns_until_fire_rotation / 5.0
-#   [22-25] 4 dirs × teleport_benefit
-#             = distance_saved / (2*(gs-1)) if next cell is a known teleporter
-#               that brings the agent closer to goal, else 0.0
-#             Gives the NN a direct signal to prefer goal-shortcutting teleporters.
-#   [26]  visit_count[pos] / 10
-#   [27]  is_confused
-#   [28]  path_len / (gs²)
-#   [29]  pos == start_cell
-#   [30]  pos in known_teleports  (standing on a teleporter right now)
+# POSITION / GOAL  [0-2]  (absolute row/col removed — overfitting channel)
+#   [0]  (goal_row - row) / (gs-1)   ← goal-relative only
+#   [1]  (goal_col - col) / (gs-1)
+#   [2]  manhattan_dist / (2*(gs-1))
+#
+# LOCAL NEIGHBOURHOOD  [5-20]  4 dirs × (wall, pit, fire, visit_frac)
+#   Generalizes: reads local obstacles, not memorized map positions.
+#
+# FIRE TIMER  [21]
+#
+# TELEPORT BENEFIT  [22-25]  4 dirs × distance_saved_frac
+#
+# PROGRESS / STALL SIGNALS  [26-29]  — key for cross-maze generalization
+#   [26]  turns_since_dist_decrease / 100
+#   [27]  turns_since_new_cell / 100
+#   [28]  last_wall_hit
+#   [29]  revisit_intensity = visit_count[pos] / 20
+#
+# LOCAL STRUCTURE  [30-32]  — teaches layout-independent primitives
+#   [30]  open_neighbor_count / 4
+#   [31]  is_dead_end  (1 open neighbour)
+#   [32]  is_corridor  (2 open, opposite)
+#
+# MISC  [33-38]
+#   [33]  dist_from_start / (2*(gs-1))
+#   [34]  visit_count[pos] / 10
+#   [35]  is_confused
+#   [36]  path_len / (gs²)
+#   [37]  pos == start_cell
+#   [38]  pos in known_teleports
 # ─────────────────────────────────────────────────────────────────────────────
 class StateEncoder:
-    DIM = 31
+    DIM = 37   # 3 goal + 16 neighbourhood + 1 fire + 4 teleport + 13 misc
 
-    def __init__(self, goal_cell:  Tuple[int,int] = None,
-                       grid_size:  int             = None,
-                       start_cell: Tuple[int,int]  = None):
+    def __init__(self, goal_cell=None, grid_size=None, start_cell=None):
         self.goal_cell  = goal_cell  or GOAL_CELL
         self.grid_size  = grid_size  or GRID_SIZE
         self.start_cell = start_cell or START_CELL
 
-    def encode(self, pos: Tuple[int,int], mem: AgentMemory,
-               current_fire: frozenset = None,
-               fire_turn_counter: int  = 0) -> np.ndarray:
-        """
-        Encode state to a 31-dimensional feature vector.
-
-        current_fire       — env.death_pits at this moment (frozenset of (r,c))
-        fire_turn_counter  — env._fire_turn_counter (0-4; fire rotates at 5)
-        """
+    def encode(self, pos, mem, current_fire=None, fire_rot_idx=0):
         r, c   = pos
-        gr, gc = self.goal_cell
+        sr, sc = self.start_cell
         gs     = self.grid_size
         g_norm = 2 * (gs - 1)
-        cur_dist = abs(gr - r) + abs(gc - c)
 
         if current_fire is None:
             current_fire = frozenset()
 
-        f = [
-            r / (gs - 1),
-            c / (gs - 1),
-            (gr - r) / (gs - 1),
-            (gc - c) / (gs - 1),
-            cur_dist / g_norm,
-        ]
+        # ── Goal features: populated only once the goal has been discovered ──
+        if GOAL_KNOWN:
+            gr, gc_g = self.goal_cell
+            cur_dist = abs(gr - r) + abs(gc_g - c)
+            f = [
+                (gr - r)   / (gs - 1),
+                (gc_g - c) / (gs - 1),
+                cur_dist   / g_norm,
+            ]
+        else:
+            cur_dist = 0
+            f = [0.0, 0.0, 0.0]
 
-        # 4 dirs × (wall, pit, fire, visit)
-        for dr, dc in DIRECTIONS:
+        # ── Local neighbourhood: 4 dirs × (wall, pit, fire, visit_frac) ──────
+        open_count = 0
+        open_dirs  = []
+        for di, (dr, dc) in enumerate(DIRECTIONS):
             nr, nc    = r + dr, c + dc
             in_bounds = (0 <= nr < gs and 0 <= nc < gs)
             wall      = (not in_bounds) or ((r, c, dr, dc) in mem.known_walls)
@@ -253,30 +287,50 @@ class StateEncoder:
             on_fire   = in_bounds and (nr, nc) in current_fire
             vis       = min(mem.visit_count[(nr, nc)] / 10.0, 1.0) if in_bounds else 0.0
             f += [float(wall), float(pit), float(on_fire), vis]
+            if not wall and not pit:
+                open_count += 1
+                open_dirs.append(di)
 
-        # Fire rotation countdown
-        f.append((5 - fire_turn_counter) / 5.0)
+        f.append(fire_rot_idx / 3.0)
 
-        # 4 dirs × teleport_benefit
-        # Positive when stepping onto a known teleporter would bring us closer to goal.
-        # Encoded as fraction of total possible distance saved (so range 0-1).
+        # ── Teleport benefit: only meaningful once goal is known ──────────────
         for dr, dc in DIRECTIONS:
             nr, nc = r + dr, c + dc
-            tp_dest = mem.known_teleports.get((nr, nc))
-            if tp_dest is not None:
-                dest_dist = abs(gr - tp_dest[0]) + abs(gc - tp_dest[1])
-                benefit   = max(0, cur_dist - dest_dist) / g_norm
+            if GOAL_KNOWN and g_norm > 0:
+                tp_dest = mem.known_teleports.get((nr, nc))
+                if tp_dest is not None:
+                    gr, gc_g  = self.goal_cell
+                    dest_dist = abs(gr - tp_dest[0]) + abs(gc_g - tp_dest[1])
+                    benefit   = max(0.0, cur_dist - dest_dist) / g_norm
+                else:
+                    benefit = 0.0
             else:
                 benefit = 0.0
             f.append(benefit)
 
-        f += [
-            min(mem.visit_count[pos] / 10.0, 1.0),
-            float(mem.is_confused),
-            min(len(mem.path) / (gs * gs), 1.0),
-            float(pos == self.start_cell),
-            float(pos in mem.known_teleports),   # standing on a teleporter
-        ]
+        # ── Progress / stall signals ──────────────────────────────────────────
+        f.append(min(mem.turns_since_dist_decrease, 100) / 100.0)
+        f.append(min(mem.turns_since_new_cell,      100) / 100.0)
+        f.append(float(mem.last_wall_hit))
+        f.append(min(mem.visit_count[pos], 20) / 20.0)
+
+        # ── Local structure ───────────────────────────────────────────────────
+        f.append(open_count / 4.0)
+        f.append(float(open_count == 1))
+        is_corridor = False
+        if open_count == 2:
+            d0, d1   = open_dirs
+            dr0, dc0 = DIRECTIONS[d0]; dr1, dc1 = DIRECTIONS[d1]
+            is_corridor = (dr0 + dr1 == 0 and dc0 + dc1 == 0)
+        f.append(float(is_corridor))
+
+        # ── Misc ──────────────────────────────────────────────────────────────
+        f.append((abs(r - sr) + abs(c - sc)) / g_norm)
+        f.append(min(mem.visit_count[pos] / 10.0, 1.0))
+        f.append(float(mem.is_confused))
+        f.append(min(len(mem.path) / (gs * gs), 1.0))
+        f.append(float(pos == self.start_cell))
+        f.append(float(pos in mem.known_teleports))
 
         return np.array(f, dtype=np.float32)
 
@@ -301,207 +355,93 @@ class EvolutionaryAgent:
         self.last_action      = None
         self.last_intended    = None
         self.stuck_count      = 0
-        self.recent_positions: List = []
-        self._forced_path: List = []
-        self.goal_reached: bool = False
-        # Set externally by evaluate_fitness so plan_turn can query fire state
+        self.recent_positions: deque = deque(maxlen=20)
+        self._forced_path:    List = []
+        self._fire_wait_count: int = 0
+        self.goal_reached:    bool = False
+        self._bfs_frustration: int = 0   # increments each BFS call that yields no new cell
+        self._random_escape_turns: int = 0  # turns of forced random walk remaining
         self.env: Optional[MazeEnvironment] = None
+        self._always_fire_cache: Optional[frozenset] = None
+        self._current_fire_cache: frozenset = frozenset()
+        self._last_fire_rot_idx: int = -1
 
-    # ── Fire helpers ──────────────────────────────────────────────────────────
     @property
     def _current_fire(self) -> frozenset:
+        # Cached per rotation index: fire only changes every 5 turns
         if self.env is None:
             return frozenset()
-        return frozenset(self.env.death_pits)
+        rot_idx = self.env._fire_rot_idx
+        if rot_idx != self._last_fire_rot_idx:
+            self._current_fire_cache = frozenset(self.env.death_pits)
+            self._last_fire_rot_idx  = rot_idx
+        return self._current_fire_cache
 
     @property
     def _always_fire(self) -> frozenset:
-        """Cells that are on fire in ALL 4 rotation states — permanently blocked."""
-        if self.env is None:
-            return frozenset()
-        return frozenset.intersection(*self.env._fire_rotation_states)
+        # Computed once per episode: intersection of all 4 rotation states never changes
+        if self._always_fire_cache is None:
+            if self.env is None:
+                return frozenset()
+            states = self.env._fire_rotation_states
+            self._always_fire_cache = (frozenset.intersection(*states)
+                                       if states else frozenset())
+        return self._always_fire_cache
 
-    def _turns_until_cell_clear(self, r: int, c: int) -> int:
-        """
-        How many turns until (r,c) is not on fire.
-        Returns 0 if the cell is clear right now.
-        Returns 5 if the cell is always on fire (never clears within one cycle).
-        """
+    # def _cell_clears_within(self, r: int, c: int, max_turns: int) -> bool:
+    #     """True if (r,c) leaves the fire rotation within max_turns."""
+    #     if self.env is None:
+    #         return True
+    #     cur_idx = self.env._fire_rot_idx
+    #     counter = self.env._fire_turn_counter
+    #     states  = self.env._fire_rotation_states
+    #     for wait in range(max_turns + 1):
+    #         state_idx = (cur_idx + (counter + wait) // 5) % 4
+    #         if (r, c) not in states[state_idx]:
+    #             return True
+    #     return False
+    def _cell_clears_within(self, r: int, c: int, max_turns: int) -> bool:
+        """True if (r,c) is not on fire at some point within the next max_turns turns."""
         if self.env is None:
-            return 0
-        counter = self.env._fire_turn_counter    # 0-4; fire rotates when it hits 5
-        states  = self.env._fire_rotation_states  # list of 4 frozensets
-        cur_idx = self.env._fire_rot_idx          # which state we're currently in
+            return True
 
-        for wait in range(5):
-            check_idx = (cur_idx + (1 if (counter + wait) >= 5 else 0) +
-                         ((counter + wait) // 5)) % 4
-            # Simpler: walk forward state by state
-            state_idx = (cur_idx + (wait + counter) // 5) % 4
+        cur_idx = self.env._fire_rot_idx
+        states  = self.env._fire_rotation_states
+
+        for wait in range(max_turns + 1):
+            state_idx = (cur_idx + wait) % 4
             if (r, c) not in states[state_idx]:
-                return wait + max(0, 5 - counter - wait)
-        return 5  # fire here through the whole rotation — don't wait
+                return True
+        return False
 
-    def plan_turn(self, last_result):
-        if last_result is not None:
-            if last_result.is_dead:
-                self.current_pos = self.start_cell
-                self._forced_path.clear()
-            else:
-                self.current_pos = last_result.current_position
-
-            if last_result.wall_hits > 0 and last_result.current_position == self.prev_pos:
-                self.stuck_count += 1
-                self._forced_path.clear()
-            else:
-                self.stuck_count = 0
-
-            if self.last_action is not None:
-                self.memory.update(self.prev_pos, self.last_action,
-                                last_result, self.last_intended)
-
-        # Oscillation detection
-        self.recent_positions.append(self.current_pos)
-        if len(self.recent_positions) > 20:
-            self.recent_positions.pop(0)
-        if len(self.recent_positions) == 20:
-            rows = [p[0] for p in self.recent_positions]
-            cols = [p[1] for p in self.recent_positions]
-            if max(rows) - min(rows) <= 4 and max(cols) - min(cols) <= 4:
-                self.recent_positions.clear()
-                self._forced_path.clear()
-                self.stuck_count = 99
-
-        # Snapshot fire state for this turn
-        current_fire      = self._current_fire
-        always_fire       = self._always_fire
-        fire_turn_counter = self.env._fire_turn_counter if self.env else 0
-
-        # If we have a forced path queued, follow it (with fire check)
-        if self._forced_path:
-            intended = self._forced_path[0]
-            # Check if the next step in the queued path leads into current fire
-            if intended != Action.WAIT:
-                idx  = MOVE_ACTIONS.index(intended)
-                dr, dc = DIRECTIONS[idx]
-                nr, nc = self.current_pos[0] + dr, self.current_pos[1] + dc
-                if (nr, nc) in current_fire and (nr, nc) not in always_fire:
-                    # Fire is temporary — wait for it to rotate rather than step in
-                    intended = Action.WAIT
-                else:
-                    self._forced_path.pop(0)
-            else:
-                self._forced_path.pop(0)
-
-            actual = INVERT_MAP[intended] if self.memory.is_confused else intended
-            self.prev_pos      = self.current_pos
-            self.last_action   = actual
-            self.last_intended = intended
-            return [actual]
-
-        state = self.encoder.encode(self.current_pos, self.memory,
-                                    current_fire, fire_turn_counter)
-        probs = self.controller.forward(state)
-
-        if self.stuck_count > 2:
-            self.stuck_count = 0
-            self.recent_positions.clear()
-            full_path = self._bfs_path_to_nearest_unvisited()
-            if full_path:
-                self._forced_path = full_path[1:]
-                intended = full_path[0]
-            else:
-                r, c = self.current_pos
-                open_dirs = [
-                    a for a, (dr, dc) in zip(MOVE_ACTIONS, DIRECTIONS)
-                    if (r, c, dr, dc) not in self.memory.known_walls
-                       and (r + dr, c + dc) not in always_fire
-                ]
-                intended = random.choice(open_dirs) if open_dirs else random.choice(MOVE_ACTIONS)
-        else:
-            if self.epsilon > 0 and random.random() < self.epsilon:
-                action_idx = random.randrange(len(ACTION_MAP))
-            else:
-                action_idx = int(np.argmax(probs))
-            intended = ACTION_MAP[action_idx]
-
-        # ── Teleporter shortcut override ─────────────────────────────────────
-        # If a neighboring cell is a known teleporter that saves meaningful
-        # distance to the goal AND the NN didn't already pick that direction,
-        # override with the teleporter step.  Threshold: saves at least 10%
-        # of current distance — avoids micro-detours.
-        if intended != Action.WAIT:
-            r, c   = self.current_pos
-            gr, gc_goal = self.goal_cell
-            cur_dist = abs(gr - r) + abs(gc_goal - c)
-            best_tp_action = None
-            best_tp_saving = cur_dist * 0.10   # must save at least 10%
-
-            for act, (dr, dc) in zip(MOVE_ACTIONS, DIRECTIONS):
-                nr, nc   = r + dr, c + dc
-                tp_dest  = self.memory.known_teleports.get((nr, nc))
-                if tp_dest is None:
-                    continue
-                dest_dist = abs(gr - tp_dest[0]) + abs(gc_goal - tp_dest[1])
-                saving    = cur_dist - dest_dist
-                if saving > best_tp_saving:
-                    # Make sure the step to the teleporter is not blocked
-                    if (r, c, dr, dc) not in self.memory.known_walls:
-                        if (nr, nc) not in self._always_fire:
-                            best_tp_saving = saving
-                            best_tp_action = act
-
-            if best_tp_action is not None:
-                intended = best_tp_action
-
-        # ── Fire-aware WAIT override ──────────────────────────────────────────
-        # If the NN picked a directional move that steps into temporary fire,
-        # substitute WAIT so the agent holds position until the fire rotates.
-        # We skip this for always_fire cells (waiting is pointless) and for
-        # the WAIT action itself.
-        if intended != Action.WAIT:
-            idx = MOVE_ACTIONS.index(intended) if intended in MOVE_ACTIONS else -1
-            if idx >= 0:
-                dr, dc = DIRECTIONS[idx]
-                nr, nc = self.current_pos[0] + dr, self.current_pos[1] + dc
-                if (nr, nc) in current_fire and (nr, nc) not in always_fire:
-                    intended = Action.WAIT   # hold until fire moves
-
-        actual = INVERT_MAP[intended] if self.memory.is_confused else intended
-        self.prev_pos      = self.current_pos
-        self.last_action   = actual
-        self.last_intended = intended
-        return [actual]
-
-    def reset_episode(self):
-        self.memory.reset_episode()
-        self.current_pos      = self.start_cell
-        self.prev_pos         = None
-        self.last_action      = None
-        self.last_intended    = None
-        self.stuck_count      = 0
-        self.recent_positions = []
-        self._forced_path     = []
-        self.goal_reached     = False
-
-    def _bfs_path_to_nearest_unvisited(self) -> List[Action]:
+    def _bfs_path_to_nearest_unvisited(self, max_depth: int) -> List[Action]:
         """
-        BFS to nearest unvisited cell, teleporter-aware.
-
-        When the frontier reaches a cell that is a known teleport source, the BFS
-        also expands from the teleport destination (at the same path cost as
-        stepping onto the teleporter).  This means BFS will find paths that use
-        teleporters as shortcuts when they lead to unvisited or closer regions.
+        Pure exploration BFS before goal is discovered.
+        Goal-biased BFS (progressive) once goal is known.
         """
-        from collections import deque
-        start = self.current_pos
+        start       = self.current_pos
         visited_bfs = {start}
-        queue = deque([(start, [])])
-        gs    = self.encoder.grid_size
-        gr, gc = self.encoder.goal_cell
+        queue       = deque([(start, [])])
+        gs          = self.encoder.grid_size
+
+        best_progressive: Optional[Tuple[int, List[Action]]] = None
+        best_any:         Optional[Tuple[int, List[Action]]] = None
+        least_visited:    Optional[Tuple[int, int, List[Action]]] = None
+
+        if GOAL_KNOWN:
+            gr, gc_g = self.encoder.goal_cell
+            cur_dist = abs(gr - start[0]) + abs(gc_g - start[1])
+        else:
+            gr = gc_g = cur_dist = None   # not used
 
         while queue:
             pos, path = queue.popleft()
+
+            if best_progressive is not None and len(path) >= 40:
+                break
+            if len(path) >= max_depth:
+                continue
+
             r, c = pos
             for action, (dr, dc) in zip(MOVE_ACTIONS, DIRECTIONS):
                 nr, nc = r + dr, c + dc
@@ -512,115 +452,355 @@ class EvolutionaryAgent:
                 if nxt in visited_bfs: continue
                 visited_bfs.add(nxt)
                 new_path = path + [action]
+                vc       = self.memory.visit_count[nxt]
 
-                if self.memory.visit_count[nxt] == 0:
-                    return new_path
+                if GOAL_KNOWN:
+                    nxt_dist = abs(gr - nr) + abs(gc_g - nc)
+                else:
+                    nxt_dist = len(new_path)   # path length as neutral tiebreaker
 
-                # If nxt is a known teleporter, also expand BFS from destination.
-                # This lets BFS discover paths through teleporters without extra cost.
+                if vc == 0:
+                    if best_any is None or nxt_dist < best_any[0]:
+                        best_any = (nxt_dist, new_path)
+                    if GOAL_KNOWN and nxt_dist < cur_dist:
+                        if best_progressive is None or nxt_dist < best_progressive[0]:
+                            best_progressive = (nxt_dist, new_path)
+                else:
+                    if least_visited is None or vc < least_visited[0]:
+                        least_visited = (vc, nxt_dist, new_path)
+
+                # Teleporter expansion
                 tp_dest = self.memory.known_teleports.get(nxt)
                 if tp_dest is not None and tp_dest not in visited_bfs:
                     visited_bfs.add(tp_dest)
-                    if self.memory.visit_count[tp_dest] == 0:
-                        return new_path   # path to teleporter reaches unvisited dest
-                    if len(new_path) < 100:
+                    tp_vc = self.memory.visit_count[tp_dest]
+                    if GOAL_KNOWN:
+                        tp_dist = abs(gr - tp_dest[0]) + abs(gc_g - tp_dest[1])
+                    else:
+                        tp_dist = len(new_path)
+                    if tp_vc == 0:
+                        if best_any is None or tp_dist < best_any[0]:
+                            best_any = (tp_dist, new_path)
+                        if GOAL_KNOWN and tp_dist < cur_dist:
+                            if best_progressive is None or tp_dist < best_progressive[0]:
+                                best_progressive = (tp_dist, new_path)
+                    else:
+                        if least_visited is None or tp_vc < least_visited[0]:
+                            least_visited = (tp_vc, tp_dist, new_path)
+                    if len(new_path) < max_depth:
                         queue.append((tp_dest, new_path))
 
-                if len(new_path) < 100:
-                    queue.append((nxt, new_path))
+                queue.append((nxt, new_path))
+
+        if best_progressive:
+            return best_progressive[1]
+        if best_any:
+            return best_any[1]
+        if least_visited and len(least_visited[2]) >= 5:
+            return least_visited[2]
+        if least_visited:
+            return least_visited[2]
         return []
+
+    def plan_turn(self, last_result):
+        # ── Update from last result ───────────────────────────────────────────
+        if last_result is not None:
+            if last_result.is_dead:
+                self.current_pos = self.start_cell
+                self._forced_path.clear()
+                self._fire_wait_count = 0
+            else:
+                self.current_pos = last_result.current_position
+
+            if (last_result.wall_hits > 0 and
+                    last_result.current_position == self.prev_pos):
+                self.stuck_count += 1
+                self._forced_path.clear()
+            else:
+                self.stuck_count = 0
+
+            if self.last_action is not None:
+                self.memory.update(
+                    self.prev_pos, self.last_action,
+                    last_result, self.last_intended,
+                    goal_cell=self.goal_cell,
+                )
+
+        # ── Oscillation / stall detection ─────────────────────────────────────
+        self.recent_positions.append(self.current_pos)
+        if len(self.recent_positions) == 20:
+            rows = [p[0] for p in self.recent_positions]
+            cols = [p[1] for p in self.recent_positions]
+            if max(rows) - min(rows) <= 5 and max(cols) - min(cols) <= 5:
+                self.recent_positions.clear()
+                self._forced_path.clear()
+                self.stuck_count = 99
+
+        # Stall: no new cell visited OR no distance progress for a while
+        if (self.memory.turns_since_new_cell > 30 or
+                (GOAL_KNOWN and self.memory.turns_since_dist_decrease > 120)):
+            if not self._forced_path:
+                self.stuck_count = max(self.stuck_count, 3)
+
+        current_fire      = self._current_fire
+        always_fire       = self._always_fire
+        fire_rot_idx = self.env._fire_rot_idx if self.env else 0
+        # ── Discovery vs exploit regime knobs ─────────────────────────────────────
+        if GOAL_KNOWN:
+            bfs_max_depth         = 60   # shallower search once goal is known
+            forced_prefix         = 1    # only commit to 1 BFS-guided step
+            escape_turns          = 4    # short random escape
+            bfs_frustration_limit = 1    # tolerate fewer stale BFS suggestions
+        else:
+            bfs_max_depth         = 150  # stronger exploration before goal discovery
+            forced_prefix         = 3    # allow longer BFS guidance
+            escape_turns          = 10   # longer breakout walk
+            bfs_frustration_limit = 3
+
+        # ── Priority 1: Forced BFS path (fire-safe) ───────────────────────────
+        if self._forced_path:
+            intended = self._forced_path[0]
+            if intended != Action.WAIT:
+                idx    = MOVE_ACTIONS.index(intended)
+                dr, dc = DIRECTIONS[idx]
+                nr, nc = self.current_pos[0] + dr, self.current_pos[1] + dc
+                if (nr, nc) in current_fire and (nr, nc) not in always_fire:
+                    if (self._fire_wait_count < MAX_FIRE_WAIT and
+                            self._cell_clears_within(nr, nc, MAX_FIRE_WAIT)):
+                        self._fire_wait_count += 1
+                        intended = Action.WAIT
+                    else:
+                        self._forced_path.clear()
+                        self._fire_wait_count = 0
+                        self.stuck_count = 99
+                        intended = Action.WAIT
+                else:
+                    self._forced_path.pop(0)
+                    self._fire_wait_count = 0
+            else:
+                self._forced_path.pop(0)
+
+            actual = INVERT_MAP[intended] if self.memory.is_confused else intended
+            self.prev_pos = self.current_pos
+            self.last_action = actual; self.last_intended = intended
+            return [actual]
+
+        # ── Priority 2: BFS recovery when stuck ───────────────────────────────
+        if self._random_escape_turns > 0:
+            # Forced random walk to break out of tight loops BFS can't escape
+            self._random_escape_turns -= 1
+            r, c = self.current_pos
+            open_dirs = [
+                a for a, (dr, dc) in zip(MOVE_ACTIONS, DIRECTIONS)
+                if (r, c, dr, dc) not in self.memory.known_walls
+                and (r+dr, c+dc) not in self.memory.known_pits
+                and (r+dr, c+dc) not in always_fire
+            ]
+            intended = (random.choice(open_dirs) if open_dirs
+                        else random.choice(MOVE_ACTIONS))
+
+        elif self.stuck_count > 2:
+            self.stuck_count = 0
+            self.recent_positions.clear()
+            full_path = self._bfs_path_to_nearest_unvisited(bfs_max_depth)
+
+            # Check if BFS target is a well-worn cell (visit count > 15)
+            # If so, BFS is just sending us back into the same pocket
+            bfs_target_fresh = False
+            if full_path:
+                r2, c2 = self.current_pos
+                for act, (dr, dc) in zip(MOVE_ACTIONS, DIRECTIONS):
+                    if act == full_path[0]:
+                        dest = (r2+dr, c2+dc)
+                        if self.memory.visit_count[dest] < 15:
+                            bfs_target_fresh = True
+                        break
+
+            if full_path and (bfs_target_fresh or self._bfs_frustration < bfs_frustration_limit):
+                self._forced_path = full_path[1:1 + forced_prefix]
+                intended = full_path[0]
+                if not bfs_target_fresh:
+                    self._bfs_frustration += 1
+                else:
+                    self._bfs_frustration = 0
+            else:
+                # BFS keeps sending us to visited cells — force random walk for 30 turns
+                self._bfs_frustration = 0
+                self._random_escape_turns = escape_turns
+                r, c = self.current_pos
+                open_dirs = [
+                    a for a, (dr, dc) in zip(MOVE_ACTIONS, DIRECTIONS)
+                    if (r, c, dr, dc) not in self.memory.known_walls
+                    and (r+dr, c+dc) not in self.memory.known_pits
+                    and (r+dr, c+dc) not in always_fire
+                ]
+                intended = (random.choice(open_dirs) if open_dirs
+                            else random.choice(MOVE_ACTIONS))
+        else:
+            # ── Priority 3: Neural network policy ────────────────────────────
+            state = self.encoder.encode(self.current_pos, self.memory, current_fire, fire_rot_idx)
+            probs = self.controller.forward(state)
+
+            # ── Action masking: zero out known walls to avoid wasting wall budget ──
+            r2, c2 = self.current_pos
+            mask = np.ones(len(ACTION_MAP), dtype=np.float32)
+            for ai, (dr, dc) in enumerate(DIRECTIONS):
+                if (r2, c2, dr, dc) in self.memory.known_walls:
+                    mask[ai] = 0.0
+            # Only apply mask if at least one action remains valid
+            masked = probs * mask
+            if masked.sum() > 1e-9:
+                probs = masked / masked.sum()
+
+            if self.epsilon > 0 and random.random() < self.epsilon:
+                # Epsilon: pick randomly from non-wall, non-pit actions only
+                valid = [ai for ai, (dr, dc) in enumerate(DIRECTIONS)
+                         if (r2, c2, dr, dc) not in self.memory.known_walls
+                         and (r2+dr, c2+dc) not in self.memory.known_pits]
+                if valid:
+                    action_idx = random.choice(valid)
+                else:
+                    action_idx = random.randrange(len(ACTION_MAP))
+            else:
+                action_idx = int(np.argmax(probs))
+            intended = ACTION_MAP[action_idx]
+
+        # ── Priority 4: Teleporter shortcut (≥15% saving) ────────────────────
+        if GOAL_KNOWN and intended != Action.WAIT:
+            r, c     = self.current_pos
+            gr, gc_g = self.goal_cell
+            cur_dist = abs(gr - r) + abs(gc_g - c)
+            if cur_dist > 0:
+                best_tp_action = None
+                threshold = cur_dist * 0.30
+                for act, (dr, dc) in zip(MOVE_ACTIONS, DIRECTIONS):
+                    nr, nc  = r + dr, c + dc
+                    tp_dest = self.memory.known_teleports.get((nr, nc))
+                    if tp_dest is None: continue
+                    saving = cur_dist - (abs(gr-tp_dest[0]) + abs(gc_g-tp_dest[1]))
+                    if saving > threshold:
+                        if (r,c,dr,dc) not in self.memory.known_walls:
+                            if (nr,nc) not in always_fire:
+                                threshold      = saving
+                                best_tp_action = act
+                if best_tp_action is not None:
+                    intended = best_tp_action
+
+        # ── Priority 5: Fire-aware WAIT (with side-step fallback) ─────────────
+        if intended != Action.WAIT and intended in MOVE_ACTIONS:
+            idx    = MOVE_ACTIONS.index(intended)
+            dr, dc = DIRECTIONS[idx]
+            nr, nc = self.current_pos[0] + dr, self.current_pos[1] + dc
+            if (nr, nc) in current_fire and (nr, nc) not in always_fire:
+                if (self._fire_wait_count < MAX_FIRE_WAIT and
+                        self._cell_clears_within(nr, nc, MAX_FIRE_WAIT)):
+                    self._fire_wait_count += 1
+                    intended = Action.WAIT
+                else:
+                    self._fire_wait_count = 0
+                    r2, c2 = self.current_pos
+                    alts = [
+                        a for a, (adr, adc) in zip(MOVE_ACTIONS, DIRECTIONS)
+                        if a != intended
+                        and (r2,c2,adr,adc) not in self.memory.known_walls
+                        and (r2+adr,c2+adc) not in self.memory.known_pits
+                        and (r2+adr,c2+adc) not in always_fire
+                        and (r2+adr,c2+adc) not in current_fire
+                    ]
+                    if alts:
+                        intended = random.choice(alts)
+            else:
+                self._fire_wait_count = 0
+
+        actual = INVERT_MAP[intended] if self.memory.is_confused else intended
+        self.prev_pos = self.current_pos
+        self.last_action = actual; self.last_intended = intended
+        return [actual]
+
+    def reset_episode(self):
+        self.memory.reset_episode()
+        self.current_pos         = self.start_cell
+        self.prev_pos            = None
+        self.last_action         = None
+        self.last_intended       = None
+        self.stuck_count         = 0
+        self.recent_positions    = deque(maxlen=20)
+        self._forced_path        = []
+        self._fire_wait_count    = 0
+        self.goal_reached        = False
+        self._bfs_frustration    = 0
+        self._random_escape_turns = 0
+        self._always_fire_cache  = None
+        self._current_fire_cache = frozenset()
+        self._last_fire_rot_idx  = -1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. Fitness Functions
-#
-#   EXPLORE  — prioritise finding new ground and inching toward the goal.
-#              Deaths are a mild disincentive so the agent isn't paralysed by
-#              caution, but exploration and proximity dominate.
-#
-#   OPTIMIZE — once the maze is known to be solvable, gate most of the fitness
-#              on actually reaching the goal and doing so cleanly.  Agents that
-#              don't solve it get only a token proximity score so selection
-#              pressure is almost entirely on efficiency: low turns, zero
-#              deaths, no wall thrashing.
 # ─────────────────────────────────────────────────────────────────────────────
 def _fitness_explore(goal_reached: bool, turns: int, deaths: int,
                      wall_hits: int, unique_cells: set,
                      gc: Tuple[int,int]) -> float:
-    """
-    Phase 1 — exploration-first fitness.
+    if not unique_cells:
+        return -10_000.0
 
-    Each time the agent sets a new personal best distance to the goal it earns
-    a large bonus, rewarding progressive penetration of the maze.  Exploration
-    breadth (unique cells) is also heavily rewarded.  Deaths and wall hits are
-    penalised lightly so the agent explores freely rather than hovering near
-    the start.
-    """
-    fit = 0.0
+    max_dist = 2 * (GRID_SIZE - 1)
+    fit      = 0.0
+    min_dist = max_dist
 
-    # Progressive approach bonuses — reward every new closest-distance record
-    min_dist = 2 * (GRID_SIZE - 1)   # worst possible Manhattan distance
     for pos in unique_cells:
-        d = abs(gc[0] - pos[0]) + abs(gc[1] - pos[1])
+        d = abs(gc[0]-pos[0]) + abs(gc[1]-pos[1])
         if d < min_dist:
             min_dist = d
-            fit += 500              # bonus per new record
+            fit += 500              # progressive approach bonus per new record
 
-    fit += 300 * ((2 * (GRID_SIZE - 1)) - min_dist)   # final proximity reward
-    fit += 10  * len(unique_cells)                      # exploration breadth
-    fit -= 50  * deaths                                 # mild death penalty
-    fit -= 5   * wall_hits                              # mild wall penalty
-    fit -= 1   * turns                                  # tiny speed incentive
+    # Linear proximity
+    fit += 300 * (max_dist - min_dist)
+
+    # Exponential proximity bonus — breaks the dist~57 local maximum.
+    # Gives a massive selective advantage to agents that get genuinely close.
+    # At dist=60: ~0.  At dist=40: ~750.  At dist=20: ~6000.  At dist=5: ~96000.
+    if min_dist < max_dist * 0.65:
+        fit += 1500 * (max_dist / max(min_dist, 1)) - 1500
+
+    # New cell bonus: count cells visited exactly once (genuine exploration)
+    # This is approximated here as total unique — but strong signal regardless
+    fit += 10  * len(unique_cells)                      # breadth (was 8, raised for exploration)
+    fit -= 3.0 * max(0, turns - len(unique_cells))      # loop/revisit penalty — doubled (was 4.0)
+    fit -= 15  * wall_hits                              # wall penalty
+    fit -= 750 * deaths                                 # death hurts more — stops risky fire rushing
+    fit -= 0.5 * turns                                  # mild speed pressure (was 1.0)
 
     if goal_reached:
-        fit += 100_000              # large goal bonus — still the main prize
-
+        fit += 120_000
     return fit
 
 
-def _fitness_optimize(goal_reached: bool, turns: int, deaths: int, wall_hits: int, unique_cells: set, gc: Tuple[int,int]) -> float:
+def _fitness_optimize(goal_reached: bool, turns: int, deaths: int,wall_hits: int, unique_cells: set,
+                      gc: Tuple[int,int], phase_blend: float = 1.0) -> float:
     """
-    Phase 2 — efficiency-first fitness.
-
-    Priority order (explicit):
-      1. Fewest moves   — primary signal, largest per-unit weight
-      2. Fewest deaths  — each death costs ~30 turns-equivalent
-      3. Fewest walls   — each wall costs ~0.25 turns-equivalent
-
-    All solvers beat all non-solvers (500k base gap).
-    No exploration bonus — detours cost turns and are directly penalised.
-
-    Scale reference for a typical solved episode:
-      300 turns × 100 = 30 000 turns cost
-      1 death   × 3000 =  3 000 death cost  (= 30 extra turns)
-      50 walls  ×  25  =  1 250 wall cost   (= 12.5 extra turns)
-
-    Non-solver consolation uses the explore formula (capped at 49k) so the
-    population keeps a meaningful gradient toward the goal even after the
-    phase switch.  The hard cap guarantees every real solver outscores every
-    consolation score regardless of proximity.
+    Smooth blend: phase_blend 0→explore, 1→optimize.
+    All solvers beat all non-solvers (500k base; c=35 ensures 10k-turn solver
+    scores 150k which is safely above any non-solver consolation score).
     """
     if goal_reached:
-        fit  = 500_000              # all solvers beat all non-solvers
-        #
-        # Turn coefficient MUST satisfy: 500k - c×max_turns > consolation_cap (49k)
-        # → c < (500k - 49k) / max_turns = 451k / 10k = 45.1
-        # Using c=40 guarantees even a 10 000-turn solver scores 100 000 > 49 000.
-        #
-        fit -= 40    * turns        # priority 1 — minimize moves  (1 turn  = 40 pts)
-        fit -= 3_000 * deaths       # priority 2 — each death ≈ 75 turns-equivalent
-        fit -= 25    * wall_hits    # priority 3 — each wall  ≈ 0.6 turns-equivalent
+        opt  = 500_000
+        opt -= 80   * turns
+        opt -= 5_000 * deaths
+        opt -= 80   * wall_hits
     else:
-        # Use the explore formula as consolation — it provides a rich gradient
-        # (proximity + progressive approach bonuses + mild death/wall penalties)
-        # that keeps non-solvers pushing toward the goal rather than staying
-        # frozen near the start to avoid death penalties.
-        # Hard-capped at 49k so no non-solver can ever beat an actual solver
-        # (worst-case solver: 500k - 100×10000 = negative, but typical is >>49k).
-        fit = _fitness_explore(False, turns, deaths, wall_hits, unique_cells, gc)
-        fit = min(fit, 49_000)
+        opt = 0
+        if unique_cells:
+            min_dist = min(abs(gc[0]-r)+abs(gc[1]-c) for r,c in unique_cells)
+        else:
+            min_dist = 2*(GRID_SIZE-1)
+        opt  = 300 * ((2*(GRID_SIZE-1)) - min_dist)
+        opt += 5   * len(unique_cells)
+        opt -= 200 * deaths
+        opt -= 3   * wall_hits
 
-    return fit
+    exp = _fitness_explore(goal_reached, turns, deaths, wall_hits, unique_cells, gc)
+    return phase_blend * opt + (1.0 - phase_blend) * exp
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -647,24 +827,20 @@ def evaluate_fitness(controller:    NeuralController,
                      step_interval: int   = 50,
                      phase:         str   = PHASE_EXPLORE,
                      ) -> Tuple[float, EvolutionaryAgent]:
-    """
-    Evaluate a controller over `episodes` episodes.
-
-    phase  — PHASE_EXPLORE (default) or PHASE_OPTIMIZE.  Controls which
-             fitness formula is used.  Pass the GeneticAlgorithm's current
-             phase so fitness pressure automatically adapts mid-run.
-
-    When step_q is provided, streams agent position every step_interval turns
-    so the display can animate the agent moving in real-time.
-    """
-    import time
+    import time as _time
     gc = goal_cell  or GOAL_CELL
     sc = start_cell or START_CELL
 
-    fitness_fn = _fitness_optimize if phase == PHASE_OPTIMIZE else _fitness_explore
+    if phase == PHASE_OPTIMIZE:
+        pg    = getattr(env, "_phase_gen",       0)
+        tg    = getattr(env, "_transition_gens", 20)
+        blend = min(1.0, pg / max(tg, 1))
+        def fitness_fn(*args): return _fitness_optimize(*args, phase_blend=blend)
+    else:
+        fitness_fn = _fitness_explore
 
     agent     = EvolutionaryAgent(controller, gc, sc, epsilon, persist)
-    agent.env = env   # gives plan_turn access to live fire state
+    agent.env = env
     total_fit = 0.0
 
     for ep in range(episodes):
@@ -673,9 +849,7 @@ def evaluate_fitness(controller:    NeuralController,
         agent.current_pos = sp
 
         last_result  = None
-        turns        = 0
-        deaths       = 0
-        wall_hits    = 0
+        turns = deaths = wall_hits = 0
         goal_reached = False
         unique_cells: set = {sp}
 
@@ -691,14 +865,14 @@ def evaluate_fitness(controller:    NeuralController,
             wall_hits   += last_result.wall_hits
 
             if turns % 50 == 0:
-                time.sleep(0)
+                _time.sleep(0)
 
             if step_q is not None and turns % step_interval == 0:
                 try:
                     step_q.put_nowait({
                         "type":       "step",
                         "agent_pos":  agent.current_pos,
-                        "agent_path": list(agent.memory.path[-300:]),
+                        "agent_path": list(agent.memory.path[-5000:]),
                     })
                 except Exception:
                     pass
@@ -715,22 +889,23 @@ def evaluate_fitness(controller:    NeuralController,
                     if last_result.teleported:  extras.append(f"🌀 TELEPORT→{last_result.current_position}")
                     if last_result.is_confused: extras.append("😵 CONFUSED")
                     tag  = "  " + " ".join(extras) if extras else ""
-                    dist = abs(gc[0]-last_result.current_position[0]) + abs(gc[1]-last_result.current_position[1])
+                    dist = abs(gc[0]-last_result.current_position[0])+abs(gc[1]-last_result.current_position[1])
                     print(f"  t{turns:05d} {sym}  pos={last_result.current_position}"
                           f"  dist={dist:3d}{tag}")
 
             if last_result.is_dead:
                 deaths += 1
-
             if last_result.is_goal_reached:
                 goal_reached = True
+                if not GOAL_KNOWN:
+                    set_goal_known(True)
+                    print(f"\n  🎯 GOAL DISCOVERED at {gc}! "
+                          f"All future agents will navigate directly.\n")
                 if verbose:
-                    print(f"  ✓ GOAL reached in {turns} turns!"
-                          f"  deaths={deaths}  walls={wall_hits}")
+                    print(f"  ✓ GOAL in {turns} turns!  deaths={deaths}  walls={wall_hits}")
                 break
 
-        agent.goal_reached = goal_reached   # expose for GA phase tracking
-
+        agent.goal_reached = goal_reached
         ep_fit = fitness_fn(goal_reached, turns, deaths, wall_hits, unique_cells, gc)
 
         if verbose:
@@ -747,70 +922,60 @@ def evaluate_fitness(controller:    NeuralController,
 
 
 def replay_best(weights_path: str, maze_path: str, max_turns: int = 10_000):
-    """Load saved weights and run one verbose episode."""
     from environment import MazeEnvironment as _Env
     env = _Env(maze_path)
     configure(env.start_cell, env.goal_cell)
+    env._phase_gen = 999; env._transition_gens = 20
     print(f"[replay] maze={maze_path}  start={START_CELL}  goal={GOAL_CELL}")
-
     ctrl = NeuralController()
     ctrl.load(weights_path)
-
-    fit, agent = evaluate_fitness(
-        ctrl, env,
-        goal_cell  = GOAL_CELL,
-        start_cell = START_CELL,
-        episodes   = 1,
-        max_turns  = max_turns,
-        epsilon    = 0.0,
-        verbose    = True,
-        phase      = PHASE_OPTIMIZE,   # replay always judges by efficiency
-    )
-    print(f"\n[replay] final fitness={fit:+.0f}"
-          f"  path_length={len(agent.memory.path)}"
-          f"  unique_cells={len(agent.memory.visit_count)}")
+    fit, agent = evaluate_fitness(ctrl, env,
+        goal_cell=GOAL_CELL, start_cell=START_CELL,
+        episodes=1, max_turns=max_turns, epsilon=0.0,
+        verbose=True, phase=PHASE_OPTIMIZE)
+    print(f"\n[replay] fitness={fit:+.0f}  path={len(agent.memory.path)}"
+          f"  unique={len(agent.memory.visit_count)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Genetic Algorithm
+# 7. Genetic Algorithm  (random immigrants for diversity)
 # ─────────────────────────────────────────────────────────────────────────────
 class GeneticAlgorithm:
     """
-    Evolutionary loop with automatic two-phase training.
+    Two-phase GA with smooth blend transition and random immigrants.
 
-    Phase transition
-    ────────────────
-    The GA starts in PHASE_EXPLORE.  Every generation it counts how many
-    individuals reached the goal.  Once the *cumulative* solver count across
-    all generations reaches `phase_switch_k`, it switches to PHASE_OPTIMIZE
-    and logs a banner.  The switch is permanent for the rest of the run.
+    Random immigrants: each generation 5% of the new population is replaced
+    with freshly randomized controllers, continuously injecting diversity
+    and preventing premature convergence on training-maze-specific paths.
 
-    `phase_switch_k` (default 5) can be tuned:
-      - Lower (2-3) → switch earlier, risk switching before the population
-        has a stable path to goal.
-      - Higher (8-10) → longer exploration before optimising, better for
-        large / heavily hazarded mazes.
+    Phase regression: if a generation produces zero solvers during OPTIMIZE,
+    temporarily revert to EXPLORE to rebuild the goal gradient.
     """
 
     def __init__(self,
-                 pop_size:        int   = 60,
+                 pop_size:        int   = 100,
                  layer_sizes:     List  = None,
-                 elite_frac:      float = 0.10,
-                 tournament_k:    int   = 4,
+                 elite_frac:      float = 0.40,   # was 0.05 — keep top 15% so solvers survive
+                 tournament_k:    int   = 4,       # was 3 — stronger selection pressure
                  crossover_prob:  float = 0.70,
-                 init_mut_sigma:  float = 0.15,
-                 mut_decay:       float = 0.97,
-                 min_mut_sigma:   float = 0.02,
-                 phase_switch_k:  int   = 5):
-        self.pop_size       = pop_size
-        self.layer_sizes    = layer_sizes or NeuralController.DEFAULT_LAYERS
-        self.elite_frac     = elite_frac
-        self.tournament_k   = tournament_k
-        self.crossover_prob = crossover_prob
-        self.mut_sigma      = init_mut_sigma
-        self.mut_decay      = mut_decay
-        self.min_mut_sigma  = min_mut_sigma
-        self.phase_switch_k = phase_switch_k
+                 init_mut_sigma:  float = 0.20,
+                 mut_decay:       float = 0.997,  # slow — sigma stays high long enough to evolve
+                 min_mut_sigma:   float = 0.08,   # raised — always enough diversity to escape local max
+                 phase_switch_k:  int   = 1,
+                 immigrant_frac:  float = 0.00,   # was 0.05 — fewer immigrants, less dilution
+                 transition_gens: int   = 20):
+        self.pop_size        = pop_size
+        self.layer_sizes     = layer_sizes or NeuralController.DEFAULT_LAYERS
+        self.elite_frac      = elite_frac
+        self.tournament_k    = tournament_k
+        self.crossover_prob  = crossover_prob
+        self.mut_sigma       = init_mut_sigma
+        self.mut_decay       = mut_decay
+        self.min_mut_sigma   = min_mut_sigma
+        self.phase_switch_k  = phase_switch_k
+        self.immigrant_frac  = immigrant_frac
+        self.transition_gens = transition_gens
+        self.phase_gen       = 0
 
         self.population: List[NeuralController] = [
             NeuralController(self.layer_sizes) for _ in range(pop_size)
@@ -822,33 +987,42 @@ class GeneticAlgorithm:
         self.best_fitness    = -np.inf
         self.history: List[dict] = []
 
-        # Phase tracking
-        self.phase               = PHASE_EXPLORE
-        self.cumulative_solvers  = 0   # total goal-reaching individuals so far
+        self.phase              = PHASE_EXPLORE
+        self.cumulative_solvers = 0
 
     @property
     def is_optimizing(self) -> bool:
         return self.phase == PHASE_OPTIMIZE
 
-    def _maybe_switch_phase(self, gen_solvers: int):
-        """Accumulate solver count; flip to OPTIMIZE once threshold is met."""
+    def _maybe_switch_phase(self, gen_solvers: int, env=None):
         if self.phase == PHASE_OPTIMIZE:
+            # if gen_solvers == 0:
+            #     # Regression — temporarily revert for gradient recovery
+            #     self.phase = PHASE_EXPLORE
+            #     print("  [phase] Zero solvers — reverting to EXPLORE for gradient recovery\n")
+            # else:
+            self.phase_gen += 1
+            if env is not None:
+                env._phase_gen       = self.phase_gen
+                env._transition_gens = self.transition_gens
             return
+
         self.cumulative_solvers += gen_solvers
         if self.cumulative_solvers >= self.phase_switch_k:
-            self.phase = PHASE_OPTIMIZE
-            # Boost sigma so the population can adapt to the new fitness landscape.
-            # After many explore generations sigma may have decayed to ~0.05;
-            # bumping it back up prevents the population from being frozen when
-            # the fitness scale changes completely.
-            self.mut_sigma = max(self.mut_sigma, 0.10)
+            self.phase     = PHASE_OPTIMIZE
+            self.phase_gen = 0
+            self.mut_sigma = min(self.mut_sigma, 0.03)
+            self.min_mut_sigma = 0.01
+            if env is not None:
+                env._phase_gen       = 0
+                env._transition_gens = self.transition_gens
             print(
-                f"\n  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"\n  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"  🎯  PHASE SWITCH → OPTIMIZE\n"
-                f"      {self.cumulative_solvers} cumulative solvers reached goal.\n"
-                f"      Fitness now rewards efficiency: turns, deaths, wall hits.\n"
-                f"      σ reset to {self.mut_sigma:.3f} to aid landscape adaptation.\n"
-                f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"      cumulative solvers: {self.cumulative_solvers}\n"
+                f"      blend over {self.transition_gens} generations\n"
+                f"      σ bumped to {self.mut_sigma:.3f}\n"
+                f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             )
 
     def _tournament_select(self) -> int:
@@ -862,7 +1036,7 @@ class GeneticAlgorithm:
         child.set_flat_weights(np.where(mask, w1, w2))
         return child
 
-    def _mutate(self, ctrl, mutation_rate: float = 0.08):
+    def _mutate(self, ctrl, mutation_rate: float = 0.10):
         w    = ctrl.get_flat_weights().copy()
         mask = np.random.rand(len(w)) < mutation_rate
         w   += mask * np.random.randn(len(w)) * self.mut_sigma

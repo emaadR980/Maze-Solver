@@ -106,7 +106,7 @@ class MazeEnvironment:
         self.confused_turns_left : int  = 0
         self.cells_explored      : set  = set()
         self.episode_active      : bool = True
-        self._fire_turn_counter  : int  = 0   # fire rotates every 5 turns
+        self._fire_turn_counter  : int  = 0   # fire rotates every turn
 
         # ── BUILD ADJACENCY (fixes wall-detection) ────────────────────────────
         self._build_adjacency()
@@ -365,19 +365,35 @@ class MazeEnvironment:
         if self.confused_turns_left > 0:
             self.confused_turns_left -= 1
 
-        # fire rotates 90° every 5 turns
-        self._fire_turn_counter += 1
-        if self._fire_turn_counter >= 5:
-            self._fire_turn_counter = 0
-            self._fire_rot_idx = (self._fire_rot_idx + 1) % 4
-            # clear old pits
-            for r, c in self.death_pits:
-                py = min(r*self.CELL_SIZE + self.CELL_SIZE//2, self.loader.maze_array.shape[0]-1)
-                px = min(c*self.CELL_SIZE + self.CELL_SIZE//2, self.loader.maze_array.shape[1]-1)
-                self.grid[r][c] = bool(self.loader.maze_array[py, px])
-            self.death_pits = set(self._fire_rotation_states[self._fire_rot_idx])
-            for r, c in self.death_pits:
-                self.grid[r][c] = True
+        # # fire rotates 90° every 5 turns
+        # self._fire_turn_counter += 1
+        # if self._fire_turn_counter >= 5:
+        #     self._fire_turn_counter = 0
+        #     self._fire_rot_idx = (self._fire_rot_idx + 1) % 4
+        #     # clear old pits
+        #     for r, c in self.death_pits:
+        #         py = min(r*self.CELL_SIZE + self.CELL_SIZE//2, self.loader.maze_array.shape[0]-1)
+        #         px = min(c*self.CELL_SIZE + self.CELL_SIZE//2, self.loader.maze_array.shape[1]-1)
+        #         self.grid[r][c] = bool(self.loader.maze_array[py, px])
+        #     self.death_pits = set(self._fire_rotation_states[self._fire_rot_idx])
+        #     for r, c in self.death_pits:
+        #         self.grid[r][c] = True
+
+        # self.turn_count += 1
+        # return result
+        # fire rotates 90° every turn
+        self._fire_rot_idx = (self._fire_rot_idx + 1) % 4
+
+        # clear old pits
+        for r, c in self.death_pits:
+            py = min(r * self.CELL_SIZE + self.CELL_SIZE // 2, self.loader.maze_array.shape[0] - 1)
+            px = min(c * self.CELL_SIZE + self.CELL_SIZE // 2, self.loader.maze_array.shape[1] - 1)
+            self.grid[r][c] = bool(self.loader.maze_array[py, px])
+
+        self.death_pits = set(self._fire_rotation_states[self._fire_rot_idx])
+
+        for r, c in self.death_pits:
+            self.grid[r][c] = True
 
         self.turn_count += 1
         return result
@@ -516,5 +532,6 @@ if __name__ == "__main__":
     env.reset()
     env.confused_turns_left = 0
     visualize_fire_pits(env, "fire_before.png", MAZE_PATH)
-    env.step([Action.WAIT] * 5)
+    # env.step([Action.WAIT] * 5)
+    env.step([Action.WAIT])
     visualize_fire_pits(env, "fire_after.png", MAZE_PATH)
