@@ -5,11 +5,11 @@ Silent Cartographer: COSC 4368 AI Spring 2026
   • Training runs in a separate PROCESS (bypasses Python's GIL entirely)
   • Map rendered as a single pre-composed numpy RGBA array
   • Queue-based communication: training process → display process
-  • Fire pits animate using env's own rotate_fire_clusters() — always correct
+  • Fire pits animate using env's own fire rotation states — always correct
   • Agent traversal streams live during best-individual replay
 
 Run:
-    python live_viz.py --maze MAZE_1.png [--pop 60] [--gens 80] [--turns 10000]
+    python live_viz.py --maze maze-alpha/MAZE_1.png [--pop 60] [--gens 80] [--turns 10000]
 """
 from __future__ import annotations
 import argparse, time
@@ -59,8 +59,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
 
             print(f"\n{'─'*60}")
             print(f"  Gen {gen_num:3d} START  σ={self.mut_sigma:.4f}"
-                  f"  pop={self.pop_size}  phase=[{self.phase}]"
-                  f"  goal_known={ma.GOAL_KNOWN}")
+                  f"  pop={self.pop_size}  phase=[{self.phase}]")
             print(f"{'─'*60}")
 
             gen_new_cells_list = []
@@ -90,8 +89,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                           f"  std={self.fitness[:i+1].std():.0f}"
                           f"  solvers={gen_solvers}"
                           f"  new_cells(best)={max(gen_new_cells_list[:i+1])}"
-                          f"  [{self.phase}]"
-                          f"  goal_known={ma.GOAL_KNOWN}")
+                          f"  [{self.phase}]")
 
             gen_best_new_cells = max(gen_new_cells_list) if gen_new_cells_list else 0
 
@@ -112,7 +110,6 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                 "solvers":    gen_solvers,
                 "new_cells":  gen_best_new_cells,
                 "phase":      self.phase,
-                "goal_known": ma.GOAL_KNOWN,
             }
             self.history.append(rec)
             print(f"\n{'='*60}")
@@ -121,7 +118,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                   f"  σ={self.mut_sigma:.4f}")
             print(f"           solvers={gen_solvers}/{self.pop_size}"
                   f"  new_cells(best)={gen_best_new_cells}"
-                  f"  [{self.phase}]  goal_known={ma.GOAL_KNOWN}  {tag}")
+                  f"  [{self.phase}]  {tag}")
             print(f"{'='*60}\n")
 
             if best_agent is not None:
@@ -134,7 +131,6 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                 vmap = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.float32)
 
             phase_label = "🔍 EXPLORE" if self.phase == PHASE_EXPLORE else "⚡ OPTIMIZE"
-            goal_label  = "🎯 GOAL KNOWN" if ma.GOAL_KNOWN else "❓ EXPLORING"
 
             snapshot = {
                 "type":       "gen",
@@ -146,7 +142,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                                f"  mean={rec['mean']:+.0f}"
                                f"  σ={self.mut_sigma:.4f}"
                                f"  solvers={gen_solvers}/{self.pop_size}"
-                               f"  {phase_label}  {goal_label}  {tag}"),
+                               f"  {phase_label}  {tag}"),
                 "done":       False,
             }
             try:
@@ -154,7 +150,6 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
             except _queue.Full:
                 pass
 
-            # Phase transition check
             self._maybe_switch_phase(gen_solvers, env=env)
 
             # ── Breed next generation ─────────────────────────────────────────
@@ -170,7 +165,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                     child = p1.clone()
                 new_pop.append(self._mutate(child))
 
-            # Random immigrants injected into bottom (non-elite) slots only
+            # Random immigrants into bottom (non-elite) slots only
             n_immigrants = max(1, int(self.immigrant_frac * self.pop_size))
             inject_start = max(elite_k, self.pop_size - n_immigrants)
             for k in range(self.pop_size - inject_start):
@@ -217,8 +212,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                 last_best = ga.best_fitness
                 print(f"\n  ── Live replay (gen {gen_i+1},"
                       f" fitness={ga.best_fitness:+.0f}"
-                      f" [{ga.phase}]"
-                      f" goal_known={ma.GOAL_KNOWN}) ──")
+                      f" [{ga.phase}]) ──")
                 evaluate_fitness(
                     ga.best_individual, env,
                     goal_cell=ma.GOAL_CELL, start_cell=ma.START_CELL,
@@ -234,8 +228,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                      "status": f"✓ Done — {args_dict['gens']} gens"
                                f"  best={ga.best_fitness:+.0f}"
                                f"  saved → {weights_file}"
-                               f"  [{ga.phase}]"
-                               f"  goal_known={ma.GOAL_KNOWN}",
+                               f"  [{ga.phase}]",
                      "history": list(ga.history)})
     except Exception:
         pass
@@ -243,21 +236,15 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test worker  (runs in its own process — no GA, pure evaluation)
+# Test worker
 # ─────────────────────────────────────────────────────────────────────────────
 def test_worker(maze_path: str, args_dict: dict, state_q: Queue):
-    """
-    Load saved weights and run N clean episodes (epsilon=0, optimize phase).
-    In test mode the goal location is always known (we're evaluating a trained agent).
-    """
     import maze_agent as ma
     from environment import MazeEnvironment
     from maze_agent import NeuralController, evaluate_fitness, PHASE_OPTIMIZE
 
     env = MazeEnvironment(maze_path)
     ma.configure(env.start_cell, env.goal_cell)
-    # In test mode the agent already trained — goal is known from the start
-    ma.set_goal_known(True)
 
     weights_path = args_dict.get("weights", "best_weights.npy")
     n_episodes   = args_dict.get("test_episodes", 5)
@@ -353,7 +340,7 @@ def test_worker(maze_path: str, args_dict: dict, state_q: Queue):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fire rotation: precompute all 4 states using env's own correct logic
+# Fire rotation helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def precompute_fire_rotations(env) -> list:
     return list(env._fire_rotation_states)
@@ -497,7 +484,7 @@ def build_and_run(args):
     ax_solver = fig.add_subplot(gs_right[1])
 
     ax_map.axis("off")
-    ax_map.set_title("Agent — Known World", color="#c8d0e0", fontsize=11, pad=6)
+    ax_map.set_title("Agent — Unknown Maze", color="#c8d0e0", fontsize=11, pad=6)
 
     init_frame = compose_map_frame(
         maze_rgb, stat_ov, state["fire_pits"],
@@ -541,9 +528,11 @@ def build_and_run(args):
         ax_right.legend(loc="lower right", fontsize=8,
                         facecolor="#0a1520", edgecolor="#1e2a3a", labelcolor="#c8d0e0")
 
+        # ── Solver / A* diagnostics chart ─────────────────────────────────────
         ax_solver.set_facecolor("#060b12")
         for sp in ax_solver.spines.values(): sp.set_edgecolor("#1e2a3a")
-        ax_solver.set_title("Solvers / Gen  +  σ", color="#c8d0e0", fontsize=9, pad=4)
+        ax_solver.set_title("Solvers / Gen  +  σ  (A* recovery planner)",
+                            color="#c8d0e0", fontsize=9, pad=4)
         ax_solver.set_xlabel("Generation", color="#7a8a9a", fontsize=8)
         ax_solver.tick_params(colors="#4a5a6a", labelsize=7)
         ax_solver.xaxis.set_major_locator(ticker.MaxNLocator(integer=True, nbins=20))
@@ -558,8 +547,8 @@ def build_and_run(args):
         ax_sigma.set_ylim(0, 0.25)
 
         bar_solvers = [None]
-        ln_sigma,   = ax_sigma.plot([], [], lw=1.5, color="#ffaa44",
-                                    label="σ", ls="--", zorder=2)
+        ln_sigma,  = ax_sigma.plot([], [], lw=1.5, color="#ffaa44",
+                                   label="σ", ls="--", zorder=2)
 
         ax_newcells = ax_solver.twinx()
         ax_newcells.spines["right"].set_position(("outward", 40))
@@ -572,6 +561,8 @@ def build_and_run(args):
                                  ha="right", va="top", fontsize=7,
                                  color="#aaccdd", fontfamily="monospace")
         ax_solver.set_ylabel("Solvers", color="#00e5aa", fontsize=8)
+        ax_solver.legend(loc="upper left", fontsize=7,
+                         facecolor="#0a1520", edgecolor="#1e2a3a", labelcolor="#c8d0e0")
     else:
         ax_solver.set_visible(False)
         ax_right.set_title("Test Results — Per Episode", color="#c8d0e0",
@@ -581,13 +572,13 @@ def build_and_run(args):
         ax_right.set_xlim(0, 1); ax_right.set_ylim(0, 1)
 
     ax_stat.set_facecolor("#0a1520"); ax_stat.axis("off")
-    stat_txt = ax_stat.text(0.5, 0.5, "Initialising…",
+    stat_txt = ax_stat.text(0.5, 0.5, "Visualising best run of each Generation",
                             transform=ax_stat.transAxes,
                             ha="center", va="center", fontsize=9.5,
                             color="#8ab4d4", fontfamily="monospace")
 
     _cache = {"hist_len": 0, "fire_tick": 0, "phase_marked": False,
-              "goal_marked": False, "test_len": 0, "solver_bars_drawn": 0}
+              "test_len": 0, "solver_bars_drawn": 0}
 
     def _render_test_table(results):
         ax_right.cla()
@@ -669,8 +660,10 @@ def build_and_run(args):
         txt = state["status"]
         stat_txt.set_text("✓  " + txt if state["done"] else txt)
 
+        # Fire animation — rotate every 2 display frames (1 second per rotation)
+        # keeps the visual roughly in sync with per-turn game rotation
         _cache["fire_tick"] += 1
-        if _cache["fire_tick"] >= 5:
+        if _cache["fire_tick"] >= 2:
             _cache["fire_tick"] = 0
             _fire["rot"] = (_fire["rot"] + 1) % 4
             state["fire_pits"] = _fire["rotations"][_fire["rot"]]
@@ -703,7 +696,6 @@ def build_and_run(args):
                                                         color="#2979ff", alpha=0.12, zorder=0)
                     ax_right.relim(); ax_right.autoscale_view()
 
-                    # Mark phase switch
                     if not _cache["phase_marked"]:
                         for h in hist:
                             if h.get("phase") == PHASE_OPTIMIZE:
@@ -719,26 +711,11 @@ def build_and_run(args):
                                 _cache["phase_marked"] = True
                                 break
 
-                    # Mark goal discovery
-                    if not _cache["goal_marked"]:
-                        for h in hist:
-                            if h.get("goal_known"):
-                                disc_gen = h["generation"] + 1
-                                ax_right.axvline(disc_gen, color="#00ff99",
-                                                 lw=1.2, ls=":", alpha=0.8, zorder=4)
-                                ax_right.text(disc_gen + 0.2,
-                                              ax_right.get_ylim()[0] * 0.95
-                                              if ax_right.get_ylim()[0] < 0 else 0,
-                                              "🎯 found", color="#00ff99",
-                                              fontsize=7, va="bottom")
-                                _cache["goal_marked"] = True
-                                break
-
-                    solver_counts  = [h["solvers"]   for h in hist]
-                    sigma_vals     = [h["sigma"]     for h in hist]
-                    new_cell_vals  = [h.get("new_cells", 0) for h in hist]
-                    cumulative     = sum(solver_counts)
-                    pop_size       = args_dict.get("pop", 60)
+                    solver_counts = [h["solvers"]         for h in hist]
+                    sigma_vals    = [h["sigma"]            for h in hist]
+                    new_cell_vals = [h.get("new_cells", 0) for h in hist]
+                    cumulative    = sum(solver_counts)
+                    pop_size      = args_dict.get("pop", 60)
 
                     if len(solver_counts) != _cache["solver_bars_drawn"]:
                         _cache["solver_bars_drawn"] = len(solver_counts)
@@ -782,32 +759,22 @@ def main():
     p = argparse.ArgumentParser(
         description="Silent Cartographer — Live Dashboard (train or test)")
 
-    # Shared
-    p.add_argument("--maze",  default="MAZE_1.png", help="Maze image file")
+    p.add_argument("--maze",  default="maze-alpha/MAZE_1.png", help="Maze image file")
     p.add_argument("--turns", type=int, default=10_000, help="Max turns per episode")
-
-    # Mode
-    p.add_argument("--test", action="store_true",
+    p.add_argument("--test",  action="store_true",
                    help="Test mode: evaluate saved weights, no GA")
 
-    # Test-only
-    p.add_argument("--weights",       default="best_weights.npy",
-                   help="[test] weights file to load")
-    p.add_argument("--test_episodes", type=int, default=10,
-                   help="[test] number of evaluation episodes")
+    p.add_argument("--weights",       default="best_weights.npy")
+    p.add_argument("--test_episodes", type=int, default=10)
 
-    # Train-only
     p.add_argument("--pop",      type=int,   default=60)
     p.add_argument("--gens",     type=int,   default=80)
     p.add_argument("--sigma",    type=float, default=0.20)
     p.add_argument("--decay",    type=float, default=0.995)
     p.add_argument("--eps_eval", type=int,   default=1)
-    p.add_argument("--persist",  action="store_true",
-                   help="[train] shared memory across episodes")
-    p.add_argument("--phase_k",  type=int, default=5,
-                   help="[train] cumulative solvers to trigger OPTIMIZE phase")
-    p.add_argument("--run_id",   default=None,
-                   help="[train] tag for this run's weight file")
+    p.add_argument("--persist",  action="store_true")
+    p.add_argument("--phase_k",  type=int,   default=5)
+    p.add_argument("--run_id",   default=None)
 
     args = p.parse_args()
     build_and_run(args)
