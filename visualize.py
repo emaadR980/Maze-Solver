@@ -21,7 +21,7 @@ _HAZARD_COLOUR  = {
 def _cell_centre(env, r: int, c: int) -> Tuple[int, int]:
     cell = env.CELL_SIZE
     px = min(c * cell + cell // 2, env.loader.w - 1)
-    py = min(r * cell + cell // 2, env.loader.h - 1)
+    py = min(r * cell + cell // 2, env.loader.h - 1)  
     return px, py     # PIL / matplotlib: x = col-direction, y = row-direction
 
 
