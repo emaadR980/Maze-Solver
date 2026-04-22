@@ -139,6 +139,8 @@ class AgentMemory:
             self.known_teleports = self._shared_teleports
 
         self.cell_rotation_mask: Dict   = {}   # cell -> frozenset of rotation indices where fire is present
+        self.known_arrow_up:    set    = set()  # arrow pad cells that push UP
+        self.known_arrow_left:  set    = set()  # arrow pad cells that push LEFT
         self.path:                      List = []
         self.is_confused:               bool = False
         self.confused_turns_left:       int  = 0
@@ -281,6 +283,28 @@ class AgentMemory:
                         self.known_teleports[prev_pos] = new_pos
                 except ValueError:
                     self.known_teleports[prev_pos] = new_pos
+
+        # Arrow pad detection: if pushed, the cell we stepped INTO was an arrow pad.
+        # Infer direction from prev_pos → step cell vs actual landing (new_pos).
+        if result.arrow_pushed and prev_pos is not None:
+            try:
+                idx = MOVE_ACTIONS.index(intended_action)
+                sdr, sdc = DIRECTIONS[idx]
+                step_cell = (prev_pos[0] + sdr, prev_pos[1] + sdc)
+                if 0 <= step_cell[0] < GRID_SIZE and 0 <= step_cell[1] < GRID_SIZE:
+                    # Determine which arrow type based on where we ended up vs step_cell
+                    land_dr = new_pos[0] - step_cell[0]
+                    land_dc = new_pos[1] - step_cell[1]
+                    if (land_dr, land_dc) == (-1, 0):
+                        self.known_arrow_up.add(step_cell)
+                    elif (land_dr, land_dc) == (0, -1):
+                        self.known_arrow_left.add(step_cell)
+                    # Seed a small D* Lite wall-equivalent by making the arrow cell
+                    # known as a hazard to route around unless it's beneficial.
+                    # We don't hard-wall it — D* Lite can still route through it,
+                    # but the agent knows the landing position differs from expected.
+            except ValueError:
+                pass
 
         return new_walls
 
@@ -520,7 +544,10 @@ class DStarLite:
             if (r,c,dr,dc) in self.known_walls: continue
             dest = self.known_teleports.get((nr, nc), (nr, nc))
             visits = visit_counts.get(dest, 0) if visit_counts else 0
-            cost = 1.0 + self.g[dest] + visit_penalty * visits
+            # Arrow cells cost 2: stepping on one uses the full turn and
+            # moves the agent to an unintended cell (the arrow destination).
+            arrow_cost = 1.0 if (nr, nc) not in getattr(self, '_known_arrows', set()) else 2.0
+            cost = arrow_cost + self.g[dest] + visit_penalty * visits
             if cost < best_cost:
                 best_cost   = cost
                 best_action = action
@@ -620,14 +647,19 @@ class EvolutionaryAgent:
             else:
                 self.current_pos = last_result.current_position
             if self.last_action is not None:
-                new_walls = self.memory.update(
+                update_walls = self.memory.update(
                     self.prev_pos, self.last_action,
                     last_result, self.last_intended,
                     goal_cell=self.goal_cell,
                     legacy_pit_walls=self.legacy_pit_walls)
+                new_walls |= update_walls
 
         if new_walls:
             self.dstar.notify_new_walls(new_walls)
+
+        # Sync known arrow cells into D* Lite for cost adjustment
+        self.dstar._known_arrows = (
+            self.memory.known_arrow_up | self.memory.known_arrow_left)
 
         new_tps = {k: v for k, v in self.memory.known_teleports.items()
                    if k not in self.dstar.known_teleports}

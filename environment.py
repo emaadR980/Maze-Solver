@@ -319,7 +319,7 @@ class MazeEnvironment:
                 result.teleported       = True
                 result.current_position = self.agent_pos
 
-            # Arrow pad: force one step in arrow direction
+            # Arrow pad: force one step in arrow direction, uses full turn
             if self.agent_pos in self.arrow_up or self.agent_pos in self.arrow_left:
                 _ar, _ac = self.agent_pos
                 _fdr, _fdc = (-1, 0) if self.agent_pos in self.arrow_up else (0, -1)
@@ -329,13 +329,26 @@ class MazeEnvironment:
                     self.cells_explored.add(self.agent_pos)
                     result.arrow_pushed = True
                     result.current_position = self.agent_pos
-                    # Hazard checks on landing cell still apply, then turn ends
+                    # Full hazard chain on landing cell
+                    if self.agent_pos in self.teleport_map:
+                        self.agent_pos          = self.teleport_map[self.agent_pos]
+                        result.teleported       = True
+                        result.current_position = self.agent_pos
+                    if self.agent_pos in self.confusion_pads:
+                        result.is_confused       = True
+                        self.confused_turns_left = 2
+                        self.confused_count     += 1
+                        currently_confused       = True
                     if self.agent_pos in self.death_pits:
-                        result.is_dead = True; self.death_count += 1
-                        self.agent_pos = self.start_cell
+                        result.is_dead          = True
+                        self.death_count       += 1
+                        result.current_position = self.agent_pos
+                        self.agent_pos          = self.start_cell
                     elif self.agent_pos == self.goal_cell:
-                        result.is_goal_reached = True; self.episode_active = False
-                    break   # arrow uses full turn
+                        result.is_goal_reached  = True
+                        self.episode_active     = False
+                # Arrow always uses the full turn regardless of whether push succeeded
+                break
 
             if self.agent_pos in self.confusion_pads:
                 result.is_confused       = True
