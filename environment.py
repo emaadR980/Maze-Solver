@@ -79,48 +79,9 @@ class MazeEnvironment:
         self.death_pits          = set(map(tuple, self.loader.death_pits))
         # Pass 1 — remove explicit overlap (colour-detected confusion pads)
         self.death_pits         -= self.confusion_pads
-        # Pass 2 — pixel colour analysis.
-        # Fire pit cells contain orange-red flame pixels (R >> G, B low).
-        # Confusion pad cells have a different colour profile.
-        # This works even when confusion pads are adjacent to fire pits.
-        try:
-            import numpy as _np
-            _img_arr = _np.array(Image.open(maze_image_path).convert('RGB'))
-            _CS      = self.CELL_SIZE
-            _pixel_fixed = set()
-            _debug_rows  = []
-            for (_r, _c) in list(self.death_pits):
-                _y1 = _r * _CS + 3
-                _y2 = min((_r + 1) * _CS - 3, _img_arr.shape[0])
-                _x1 = _c * _CS + 3
-                _x2 = min((_c + 1) * _CS - 3, _img_arr.shape[1])
-                _patch = _img_arr[_y1:_y2, _x1:_x2].reshape(-1, 3).astype(_np.float32)
-                # Non-white pixels only (exclude corridor background)
-                _nw = _patch[_patch.max(axis=1) < 230]
-                if len(_nw) < 4:
-                    _pixel_fixed.add((_r, _c)); continue
-                _R, _G, _B = _nw[:, 0], _nw[:, 1], _nw[:, 2]
-                # Fire-like: red dominant, orange hue, low blue
-                _fire_mask = (_R > 140) & (_R > _G * 1.4) & (_B < 120)
-                _frac = float(_fire_mask.sum()) / len(_nw)
-                _mr, _mg, _mb = int(_nw[:,0].mean()), int(_nw[:,1].mean()), int(_nw[:,2].mean())
-                _debug_rows.append((_r, _c, _frac, _mr, _mg, _mb))
-                if _frac < 0.25:
-                    _pixel_fixed.add((_r, _c))
-            self.confusion_pads |= _pixel_fixed
-            self.death_pits     -= _pixel_fixed
-            print(f"[ENV] death_pits={len(self.death_pits)}"
-                  f"  confusion_pads={len(self.confusion_pads)}"
-                  f"  (pixel→confusion: {len(_pixel_fixed)})")
-            # Show the lowest-fire-fraction cells so threshold can be tuned
-            for (_r, _c, _f, _mr, _mg, _mb) in sorted(_debug_rows, key=lambda x: x[2])[:6]:
-                _tag = "→confusion" if (_r, _c) in _pixel_fixed else "fire"
-                print(f"    ({_r:2d},{_c:2d}) fire_frac={_f:.2f}"
-                      f"  avg_rgb=({_mr},{_mg},{_mb})  [{_tag}]")
-        except Exception as _ex:
-            print(f"[ENV] pixel analysis skipped ({_ex}); "
-                  f"death_pits={len(self.death_pits)}"
-                  f"  confusion_pads={len(self.confusion_pads)}") 
+        print(f"[ENV] death_pits={len(self.death_pits)}"
+              f"  confusion_pads={len(self.confusion_pads)}")
+
         self.initial_death_pits  = set(self.death_pits)
         self.fire_clusters = self.group_clusters(self.death_pits, max_gap=3)
         self.initial_fire_clusters = [list(c) for c in self.fire_clusters]
@@ -132,6 +93,7 @@ class MazeEnvironment:
             | set(map(tuple, self.loader.teleport_purple))
             | set(map(tuple, self.loader.teleport_orange))
             | set(map(tuple, self.loader.teleport_green))
+            | set(map(tuple, self.loader.teleport_red))
         )
         for r, c in all_hazard_cells:
             self.grid[r][c] = True
@@ -139,7 +101,8 @@ class MazeEnvironment:
         self.teleport_map: dict = {}
         for group in [self.loader.teleport_purple,
                       self.loader.teleport_orange,
-                      self.loader.teleport_green]:
+                      self.loader.teleport_green,
+                      self.loader.teleport_red]:
             pads = [tuple(p) for p in group]
             for i, pad in enumerate(pads):
                 dest = pads[(i + 1) % len(pads)] if len(pads) > 1 else pad
