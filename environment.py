@@ -128,25 +128,59 @@ class MazeEnvironment:
         # ── BUILD ADJACENCY ───────────────────────────────────────────────────
         self._build_adjacency()
 
+    def _edge_is_open(self, r: int, c: int, nr: int, nc: int) -> bool:
+        """Check a shared cell edge using a band scan instead of one center pixel."""
+        ma     = self.loader.maze_array
+        cell   = self.CELL_SIZE
+        margin = 2
+        min_open = max(6, int((cell - 2 * margin) * 0.6))
+
+        if nr == r + 1 and nc == c:
+            by = min((r + 1) * cell, ma.shape[0] - 1)
+            x0 = c * cell + margin
+            x1 = (c + 1) * cell - margin
+            open_samples = 0
+            total = 0
+            for bx in range(x0, x1):
+                bx = min(max(bx, 0), ma.shape[1] - 1)
+                above = min(max(by - 2, 0), ma.shape[0] - 1)
+                below = min(max(by + 2, 0), ma.shape[0] - 1)
+                total += 1
+                if bool(ma[by, bx]) and bool(ma[above, bx]) and bool(ma[below, bx]):
+                    open_samples += 1
+            return open_samples >= min_open
+
+        if nr == r and nc == c + 1:
+            bx = min((c + 1) * cell, ma.shape[1] - 1)
+            y0 = r * cell + margin
+            y1 = (r + 1) * cell - margin
+            open_samples = 0
+            total = 0
+            for by in range(y0, y1):
+                by = min(max(by, 0), ma.shape[0] - 1)
+                left  = min(max(bx - 2, 0), ma.shape[1] - 1)
+                right = min(max(bx + 2, 0), ma.shape[1] - 1)
+                total += 1
+                if bool(ma[by, bx]) and bool(ma[by, left]) and bool(ma[by, right]):
+                    open_samples += 1
+            return open_samples >= min_open
+
+        return False
+
     # ── Adjacency from boundary pixels ───────────────────────────────────────
     def _build_adjacency(self):
         h  = self.loader.maze_height_cells
         w  = self.loader.maze_width_cells
-        ma = self.loader.maze_array
 
         self.adj = [[set() for _ in range(w)] for _ in range(h)]
         for r in range(h):
             for c in range(w):
                 if r + 1 < h:
-                    by = min((r + 1) * self.CELL_SIZE,                ma.shape[0] - 1)
-                    bx = min(c * self.CELL_SIZE + self.CELL_SIZE // 2, ma.shape[1] - 1)
-                    if ma[by, bx]:
+                    if self._edge_is_open(r, c, r + 1, c):
                         self.adj[r    ][c].add((r + 1, c))
                         self.adj[r + 1][c].add((r,     c))
                 if c + 1 < w:
-                    by = min(r * self.CELL_SIZE + self.CELL_SIZE // 2, ma.shape[0] - 1)
-                    bx = min((c + 1) * self.CELL_SIZE,                 ma.shape[1] - 1)
-                    if ma[by, bx]:
+                    if self._edge_is_open(r, c, r, c + 1):
                         self.adj[r][c    ].add((r, c + 1))
                         self.adj[r][c + 1].add((r, c    ))
 
