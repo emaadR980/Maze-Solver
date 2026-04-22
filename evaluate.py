@@ -6,12 +6,19 @@ MAX_EPISODES = 5
 MAX_TURNS    = 10_000
 
 maze_path  = sys.argv[1] if len(sys.argv) > 1 else "maze-alpha/MAZE_1.png"
-maze_label = sys.argv[2] if len(sys.argv) > 2 else maze_path.replace(".png","")
+arg2 = sys.argv[2] if len(sys.argv) > 2 else None
+if arg2 and arg2.lower().endswith(".pkl"):
+    model_path = arg2
+    maze_label = sys.argv[3] if len(sys.argv) > 3 else maze_path.replace(".png","")
+else:
+    model_path = "agent.pkl"
+    maze_label = arg2 if arg2 is not None else maze_path.replace(".png","")
 print(f"Evaluating on {maze_path}  (label: {maze_label})")
+print(f"Using model: {model_path}")
 
-env   = MazeEnvironment(maze_path)
+env   = MazeEnvironment(maze_path, rotate_fire=True)
 agent = MazeAgent()
-agent.load("agent.pkl")
+agent.load(model_path)
 agent.goal_pos = env.goal_cell
 agent.epsilon = 0.0
 agent.env = env
