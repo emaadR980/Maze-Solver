@@ -186,9 +186,6 @@ class MazeEnvironment:
         completed = set(cluster)
 
         if any(c == 0 for r, c in cluster):
-            # Left-wall cluster: the visible half starts inside the maze, and
-            # the matching leg starts outside so the east-facing phase is a
-            # full 7-cell V around the pivot.
             for k in range(1, 4):
                 completed.add((pr - k, pc - k))
         else:
@@ -292,6 +289,14 @@ class MazeEnvironment:
         w = self.loader.maze_width_cells
         if not (0 <= to_r < h and 0 <= to_c < w):
             return False
+
+        from_is_hazard = from_hazard or (from_r, from_c) in self.death_pits \
+            or (from_r, from_c) in self.confusion_pads \
+            or (from_r, from_c) in self.teleport_map
+        to_is_hazard   = to_hazard   or (to_r,   to_c)   in self.death_pits \
+            or (to_r,   to_c)   in self.confusion_pads \
+            or (to_r,   to_c)   in self.teleport_map
+
         ma    = self.loader.maze_array
         CELL  = self.CELL_SIZE
         BORDER = 1
@@ -306,7 +311,21 @@ class MazeEnvironment:
 
             x_left  = min(wall_x - 1, ma.shape[1] - 1)
             x_right = min(wall_x + 1, ma.shape[1] - 1)
-            return bool(ma[y, x_left]) and bool(ma[y, x_right])
+            x_boundary = min(wall_x, ma.shape[1] - 1)
+
+            if not bool(ma[y, x_boundary]):
+                return False
+
+            if from_c < to_c:
+                from_px, to_px = x_left, x_right
+            else:
+                from_px, to_px = x_right, x_left
+
+            if (not from_is_hazard) and (not bool(ma[y, from_px])):
+                return False
+            if (not to_is_hazard) and (not bool(ma[y, to_px])):
+                return False
+            return True
 
         else:  # vertical
             bottom_r = max(from_r, to_r)
@@ -316,7 +335,21 @@ class MazeEnvironment:
 
             y_top    = min(wall_y - 1, ma.shape[0] - 1)
             y_bottom = min(wall_y + 1, ma.shape[0] - 1)
-            return bool(ma[y_top, x]) and bool(ma[y_bottom, x])
+            y_boundary = min(wall_y, ma.shape[0] - 1)
+
+            if not bool(ma[y_boundary, x]):
+                return False
+
+            if from_r < to_r:
+                from_py, to_py = y_top, y_bottom
+            else:
+                from_py, to_py = y_bottom, y_top
+
+            if (not from_is_hazard) and (not bool(ma[from_py, x])):
+                return False
+            if (not to_is_hazard) and (not bool(ma[to_py, x])):
+                return False
+            return True
 
     def step(self, actions: List[Action]) -> TurnResult:
         if not actions or len(actions) > 5:
@@ -388,7 +421,7 @@ class MazeEnvironment:
 
         self.turn_count += 1
 
-        if self.rotate_fire_enabled:
+        if self.rotate_fire_enabled and self.turn_count % 5 == 0:
             self.rotate_fire_clusters()
 
             if not result.is_dead and self.agent_pos in self.death_pits:

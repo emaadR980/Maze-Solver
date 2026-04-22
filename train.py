@@ -1,11 +1,15 @@
+import sys
 from hazardDemo import MazeEnvironment
 from agent import MazeAgent
 
-MAX_EPISODES = 500
+MAX_EPISODES = int(sys.argv[2]) if len(sys.argv) > 2 else 500
 MAX_TURNS    = 10_000
-MAZE_PATH    = "maze-alpha/MAZE_1.png"
+MAZE_PATH    = sys.argv[1] if len(sys.argv) > 1 else "maze-alpha/MAZE_1.png"
+MODEL_PATH   = sys.argv[3] if len(sys.argv) > 3 else "agent.pkl"
+ROTATE_FIRE  = (len(sys.argv) > 4 and sys.argv[4].lower() in {"1", "true", "yes", "on"})
 
-env   = MazeEnvironment(MAZE_PATH)
+print(f"Training on {MAZE_PATH} for {MAX_EPISODES} episodes")
+env   = MazeEnvironment(MAZE_PATH, rotate_fire=ROTATE_FIRE)
 agent = MazeAgent()
 
 successes = 0
@@ -44,5 +48,6 @@ for ep in range(MAX_EPISODES):
                   f"ε={agent.epsilon:.3f} | "
                   f"known={len(agent.known)} cells")
 
-agent.save("agent.pkl")
+agent.save(MODEL_PATH)
 print(f"\nTraining complete.  Total successes: {successes}/{MAX_EPISODES}")
+print(f"Saved checkpoint: {MODEL_PATH}")
