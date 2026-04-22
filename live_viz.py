@@ -111,10 +111,12 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
             # Collective pit memory: once any agent dies on a fire pit, all
             # subsequent agents this generation start knowing about it.
             # Knowledge still comes from real deaths — spec compliant (SS4.1.2).
-            gen_shared_pits:  set = set(self.persistent_pits)
-            gen_shared_walls: set = set(self.persistent_walls)
+            gen_shared_pits:       set  = set(self.persistent_pits)
+            gen_shared_walls:      set  = set(self.persistent_walls)
+            gen_shared_teleports:  dict = dict(self.persistent_teleports)
 
             for i, ctrl in enumerate(self.population):
+                _is_immigrant = i in getattr(self, "_immigrant_indices", set())
                 fit, ep_agent = evaluate_fitness(
                     ctrl, env,
                     goal_cell=ma.GOAL_CELL, start_cell=ma.START_CELL,
@@ -122,6 +124,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                     epsilon=epsilon, persist=persist,
                     seed_pits=gen_shared_pits,
                     seed_walls=gen_shared_walls,
+                    seed_teleports=None if _is_immigrant else gen_shared_teleports,
                     phase=self.phase, step_q=None,
                 )
                 self.fitness[i] = fit
@@ -132,11 +135,13 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
 
                 # Accumulate pit AND wall discoveries for remaining agents
                 if persist and hasattr(ep_agent.memory, '_shared_pits'):
-                    gen_shared_pits  |= ep_agent.memory._shared_pits
-                    gen_shared_walls |= ep_agent.memory._shared_walls
+                    gen_shared_pits        |= ep_agent.memory._shared_pits
+                    gen_shared_walls       |= ep_agent.memory._shared_walls
+                    gen_shared_teleports.update(ep_agent.memory._shared_teleports)
                 else:
                     gen_shared_pits  |= ep_agent.memory.known_pits
                     gen_shared_walls |= ep_agent.memory.known_walls
+                    gen_shared_teleports.update(ep_agent.memory.known_teleports)
 
                 # Cumulative map: every cell ever visited by any agent, ever
                 self.cumulative_cell_set.update(ep_agent.memory.visit_count.keys())
@@ -272,8 +277,9 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
             except _queue.Full:
                 pass
 
-            self.persistent_pits  = set(gen_shared_pits)
-            self.persistent_walls = set(gen_shared_walls)
+            self.persistent_pits       = set(gen_shared_pits)
+            self.persistent_walls      = set(gen_shared_walls)
+            self.persistent_teleports  = dict(gen_shared_teleports)
 
             self._maybe_switch_phase(gen_solvers, env=env)
 
@@ -291,8 +297,10 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
 
             n_immigrants = max(1, int(self.immigrant_frac * self.pop_size))
             inject_start = max(elite_k, self.pop_size - n_immigrants)
+            self._immigrant_indices = set()
             for k in range(self.pop_size - inject_start):
                 new_pop[inject_start + k] = NeuralController(self.layer_sizes)
+                self._immigrant_indices.add(inject_start + k)
 
             self.population = new_pop
             self.mut_sigma  = max(self.min_mut_sigma, self.mut_sigma * self.mut_decay)
@@ -311,6 +319,8 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
     ga.last_recorded_best     = -float("inf")
     ga.persistent_pits        = set()
     ga.persistent_walls       = set()
+    ga.persistent_teleports   = dict()
+    ga._immigrant_indices     = set()   # tagged each gen after pop rebuild
     ga.cumulative_cell_set    = set()   # all cells ever visited by any agent
 
     print(f"[GA]  {ga.pop_size} individuals × "
@@ -324,6 +334,24 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
     weights_file = f"weights_{run_id}.npy"
     alias_file   = f"best_weights_{run_id}.npy"
     print(f"[TRAIN] weights → {weights_file}  (alias → {alias_file})\n")
+
+    # Warm-start: seed population from existing weights + mutations.
+    # Agents inherit navigation skills from a previous maze; they still
+    # need to discover this maze's specific layout from scratch.
+    _init_w = args_dict.get("init_weights")
+    if _init_w:
+        try:
+            import numpy as _np
+            flat = _np.load(_init_w)
+            if flat.size == ga.population[0].num_params:
+                for ind in ga.population:
+                    ind.set_flat_weights(flat.copy())
+                    ga._mutate(ind, mutation_rate=0.15)
+                print(f"[WARM-START] population seeded from {_init_w}")
+            else:
+                print(f"[WARM-START] skipped — param mismatch ({flat.size} vs {ga.population[0].num_params})")
+        except Exception as _e:
+            print(f"[WARM-START] failed: {_e}")
 
     epsilon   = 0.70   # D* Lite handles 70% of turns; NN handles fire timing
     for gen_i in range(args_dict["gens"]):
@@ -388,12 +416,17 @@ def _run_test_direct(args, nav_name: str):
     except Exception as e:
         print(f"[ERROR] {e}"); return
 
-    # Count total passable cells for map completeness metric
-    _total_passable = sum(
-        1 for _r in range(env.loader.maze_height_cells)
-        for _c in range(env.loader.maze_width_cells)
-        if env.adj[_r][_c]
-    )
+    # Count reachable cells via BFS from start — true navigable maze size
+    from collections import deque as _deque
+    _visited_bfs = {env.start_cell}
+    _bfs_q = _deque([env.start_cell])
+    while _bfs_q:
+        _br, _bc = _bfs_q.popleft()
+        for _nb in env.adj[_br][_bc]:
+            if _nb not in _visited_bfs:
+                _visited_bfs.add(_nb)
+                _bfs_q.append(_nb)
+    _total_passable = len(_visited_bfs)
     print(f"[TEST] maze={args.maze}  start={env.start_cell}  goal={env.goal_cell}")
     print(f"[TEST] {args.test_episodes} episodes  eps=0  (frozen)\n")
 
@@ -408,6 +441,8 @@ def _run_test_direct(args, nav_name: str):
     tp_orange    = [(r, c) for r, c in env.loader.teleport_orange]
     tp_green     = [(r, c) for r, c in env.loader.teleport_green]
     tp_red       = [(r, c) for r, c in getattr(env.loader, "teleport_red", [])]
+    arrow_up     = list(env.arrow_up)
+    arrow_left   = list(env.arrow_left)
     fire_rot     = [0]   # mutable for closure
     # Fallback: show any teleporter pads the loader colour-missed
     _tp_shown = set(map(tuple, env.loader.teleport_purple)) \
@@ -426,6 +461,20 @@ def _run_test_direct(args, nav_name: str):
     def _pagent(draw, r, c):
         _pdot(draw, r, c, (0, 0, 0), dr=6)
         _pdot(draw, r, c, (255, 255, 255), dr=4)
+
+
+    def _parrow(draw, r, c, direction):
+        """Draw a small directional arrow at cell (r,c). direction: 'up' or 'left'."""
+        x, y = _xy(r, c)
+        col = (0, 200, 255)  # cyan
+        if direction == 'up':
+            draw.line([(x, y+4), (x, y-4)], fill=col, width=2)
+            draw.line([(x, y-4), (x-3, y-1)], fill=col, width=2)
+            draw.line([(x, y-4), (x+3, y-1)], fill=col, width=2)
+        else:  # left
+            draw.line([(x+4, y), (x-4, y)], fill=col, width=2)
+            draw.line([(x-4, y), (x-1, y-3)], fill=col, width=2)
+            draw.line([(x-4, y), (x-1, y+3)], fill=col, width=2)
 
     def _ppath(draw, path):
         if not path:
@@ -470,6 +519,8 @@ def _run_test_direct(args, nav_name: str):
         for r, c in tp_green:  _pdot(draw, r, c, ( 30, 200,  70), 4)
         for r, c in tp_red:    _pdot(draw, r, c, (220,   0, 255), 4)
         for r, c in tp_extra:  _pdot(draw, r, c, (  0, 220, 220), 4)
+        for r, c in arrow_up:   _parrow(draw, r, c, "up")
+        for r, c in arrow_left: _parrow(draw, r, c, "left")
         _pdot(draw, *env.start_cell, (  0, 230, 100), 6)
         _pdot(draw, *env.goal_cell,  (  0, 220, 255), 7)
         for r, c in known_pits: _pdot(draw, r, c, (180,   0,   0), 4)
@@ -624,6 +675,7 @@ def _run_test_direct(args, nav_name: str):
             seed_pits=seed_pits, seed_walls=seed_walls,
             phase=PHASE_OPTIMIZE,
             early_stop=False,
+            legacy_pit_walls=getattr(args, "legacy_pits", False),
             step_q=step_q, step_interval=DISPLAY_EVERY,
         )
 
@@ -790,6 +842,8 @@ def _run_test_direct(args, nav_name: str):
         for r,c in tp_green:  _pdot(draw, r, c, ( 30,200, 70), 4)
         for r,c in tp_red:    _pdot(draw, r, c, (220,  0,255), 4)
         for r,c in tp_extra:  _pdot(draw, r, c, (  0,220,220), 4)
+        for r,c in arrow_up:   _parrow(draw, r, c, "up")
+        for r,c in arrow_left: _parrow(draw, r, c, "left")
         _pdot(draw, *env.start_cell, (  0,230,100), 6)
         _pdot(draw, *env.goal_cell,  (  0,220,255), 7)
         # Fire pits known at this episode
@@ -1446,6 +1500,10 @@ def main():
     p.add_argument("--persist",  action="store_true")
     p.add_argument("--phase_k",  type=int,   default=3)
     p.add_argument("--run_id",   default=None)
+    p.add_argument("--init_weights", default=None,
+                   help="Warm-start population from these weights + mutations")
+    p.add_argument("--legacy_pits", action="store_true",
+                   help="Re-enable v3 pit-wall seeding (for backward compat)")
     args = p.parse_args()
     build_and_run(args, navigator_name="D* Lite")
 

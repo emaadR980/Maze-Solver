@@ -9,6 +9,11 @@ Navigation architecture
     Treats unknown cells as free (optimistic), replans cheaply on discovery.
   • Neural network: handles fire timing, teleporter evaluation, confusion.
   • GA evolves NN weights. Fitness rewards goal-reaching speed heavily.
+
+Compatibility
+─────────────
+  • legacy_pit_walls=True  → v3 behavior (permanent walls from deaths, always-block mask)
+  • legacy_pit_walls=False → v4 behavior (fire-rotation-aware, no permanent pit walls)
 """
 
 from __future__ import annotations
@@ -133,6 +138,7 @@ class AgentMemory:
             self.visit_count     = self._shared_visits
             self.known_teleports = self._shared_teleports
 
+        self.cell_rotation_mask: Dict   = {}   # cell -> frozenset of rotation indices where fire is present
         self.path:                      List = []
         self.is_confused:               bool = False
         self.confused_turns_left:       int  = 0
@@ -141,9 +147,62 @@ class AgentMemory:
         self.last_goal_dist:            int  = 9999
         self.last_wall_hit:             bool = False
 
+
+    def learn_fire_cluster(self, death_cell: Tuple[int,int],
+                           fire_states: list,
+                           current_rot_idx: int) -> Set[Tuple]:
+        """
+        Called on death at death_cell.  Uses the 4 pre-computed rotation states
+        to learn the full cluster structure:
+          - records rotation mask for every nearby cell in the cluster
+          - immediately seeds D* Lite walls for permanent cells (fire in all 4 states)
+          - rotating cells are recorded for precise wait-timing without dying on them
+
+        Returns new wall keys to notify D* Lite.
+        """
+        new_walls: Set[Tuple] = set()
+        if not fire_states or len(fire_states) < 4:
+            return new_walls
+
+        dr_cell, dc_cell = death_cell
+
+        # Collect every cell that appears in any rotation state near death_cell.
+        # Cluster members are spatially close and co-rotate.
+        CLUSTER_RADIUS = 10
+        candidate_cells: Set[Tuple] = set()
+        for state in fire_states:
+            for (r, c) in state:
+                if abs(r - dr_cell) <= CLUSTER_RADIUS and abs(c - dc_cell) <= CLUSTER_RADIUS:
+                    candidate_cells.add((r, c))
+
+        # For each candidate, compute its rotation mask
+        for cell in candidate_cells:
+            mask = frozenset(i for i, s in enumerate(fire_states) if cell in s)
+            self.cell_rotation_mask[cell] = mask
+            self.known_pits.add(cell)   # every fire cell is a potential pit
+
+            # Permanent cells (fire in all 4 states = pivot point) → hard walls
+            if len(mask) == 4:
+                pr, pc = cell
+                for edr, edc in DIRECTIONS:
+                    fr, fc = pr - edr, pc - edc
+                    if 0 <= fr < GRID_SIZE and 0 <= fc < GRID_SIZE:
+                        wk = (fr, fc, edr, edc)
+                        if wk not in self.known_walls:
+                            self.known_walls.add(wk)
+                            new_walls.add(wk)
+
+        return new_walls
+
     def update(self, prev_pos, action, result: TurnResult, intended_action,
-               goal_cell: Tuple[int,int] = None) -> Set[Tuple]:
-        """Returns set of newly discovered wall keys for D* Lite incremental replan."""
+               goal_cell: Tuple[int,int] = None,
+               legacy_pit_walls: bool = False) -> Set[Tuple]:
+        """Returns set of newly discovered wall keys for D* Lite incremental replan.
+
+        legacy_pit_walls=True  → v3 behavior: deaths seed permanent D* Lite walls.
+        legacy_pit_walls=False → v4 behavior: only known_pits recorded; D* Lite
+                                  may route through cleared fire cells.
+        """
         new_walls: Set[Tuple] = set()
         new_pos = result.current_position
         self.path.append(new_pos)
@@ -186,14 +245,19 @@ class AgentMemory:
 
         if result.is_dead and new_pos != prev_pos:
             self.known_pits.add(new_pos)
-            pr, pc = new_pos
-            for dr, dc in DIRECTIONS:
-                fr, fc = pr - dr, pc - dc
-                if 0 <= fr < GRID_SIZE and 0 <= fc < GRID_SIZE:
-                    wk = (fr, fc, dr, dc)
-                    if wk not in self.known_walls:
-                        self.known_walls.add(wk)
-                        new_walls.add(wk)
+            if legacy_pit_walls:
+                # v3 compat: seed permanent D* Lite walls around the death cell.
+                # Correct for mazes where fire never rotates; wrong for rotating fire.
+                pr, pc = new_pos
+                for dr, dc in DIRECTIONS:
+                    fr, fc = pr - dr, pc - dc
+                    if 0 <= fr < GRID_SIZE and 0 <= fc < GRID_SIZE:
+                        wk = (fr, fc, dr, dc)
+                        if wk not in self.known_walls:
+                            self.known_walls.add(wk)
+                            new_walls.add(wk)
+            # v4: no permanent walls — fire rotates, so the cell may be passable
+            # on the next turn. The mask + fire-wait logic handles avoidance.
 
         if result.teleported:
             if new_pos == prev_pos:
@@ -207,8 +271,6 @@ class AgentMemory:
                 except ValueError:
                     pass
             else:
-                # Correctly store the teleporter SOURCE cell (the cell the agent
-                # stepped INTO), not prev_pos (the cell before the move).
                 try:
                     idx = MOVE_ACTIONS.index(intended_action)
                     tdr, tdc = DIRECTIONS[idx]
@@ -224,12 +286,7 @@ class AgentMemory:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. State Encoder  (42 features)
-#
-# [0-36]  identical local/goal/fire features as before
-# [37-41] D* Lite hint — one-hot (UP, DOWN, LEFT, RIGHT, NONE)
-#         The NN learns when to follow the hint and when to deviate.
-#         This is the genuinely learned behavior the GA selects on.
+# 3. State Encoder  (43 features)
 # ─────────────────────────────────────────────────────────────────────────────
 class StateEncoder:
     DIM = 43
@@ -294,19 +351,13 @@ class StateEncoder:
         f.append(float(pos == self.start_cell))
         f.append(float(pos in mem.known_teleports))
 
-        # D* Lite hint — one-hot: UP DOWN LEFT RIGHT NONE
         hint_vec = [0.0, 0.0, 0.0, 0.0, 0.0]
         if dstar_hint is not None and dstar_hint in MOVE_ACTIONS:
             hint_vec[MOVE_ACTIONS.index(dstar_hint)] = 1.0
         else:
-            hint_vec[4] = 1.0   # no path known
+            hint_vec[4] = 1.0
         f.extend(hint_vec)
 
-        # Feature 42: exact turns until D* Lite's next cell clears / 3
-        # 0.0 = path is clear right now
-        # 0.33 = need to wait 1 turn
-        # 0.67 = need to wait 2 turns
-        # 1.0  = need to wait 3+ turns (permanent fire handled separately)
         f.append(float(min(fire_wait_hint, 1.0)))
 
         return np.array(f, dtype=np.float32)
@@ -366,8 +417,6 @@ class DStarLite:
             nr, nc = r+dr, c+dc
             if 0 <= nr < self.gs and 0 <= nc < self.gs:
                 if (r,c,dr,dc) not in self.known_walls:
-                    # If neighbor is a known teleporter, route to its destination
-                    # (stepping onto it costs 1 action but lands at destination)
                     dest = self.known_teleports.get((nr, nc), (nr, nc))
                     yield action, dest
 
@@ -378,8 +427,6 @@ class DStarLite:
             if 0 <= pr < self.gs and 0 <= pc < self.gs:
                 if (pr,pc,dr,dc) not in self.known_walls:
                     yield (pr, pc)
-        # If u is a teleporter destination, any neighbor of the source
-        # can also precede u (by stepping onto the teleporter)
         for tp_src, tp_dst in self.known_teleports.items():
             if tp_dst == u:
                 sr, sc = tp_src
@@ -441,14 +488,12 @@ class DStarLite:
         self.compute_shortest_path()
 
     def notify_new_teleports(self, new_teleports: dict):
-        """Call when new teleporter source→destination mappings are discovered."""
         if not new_teleports: return
         self.known_teleports.update(new_teleports)
         self.km    += self._h(self.s_last)
         self.s_last = self.s_start
         affected: set = set()
         for tp_src, tp_dst in new_teleports.items():
-            # Destination cost changed; neighbors of source now have a new path
             affected.add(tp_dst)
             sr, sc = tp_src
             for tdr, tdc in DIRECTIONS:
@@ -462,13 +507,6 @@ class DStarLite:
     def next_action(self, current_pos,
                     visit_counts: dict = None,
                     visit_penalty: float = 0.0) -> Optional[Action]:
-        """
-        visit_counts: optional dict mapping cell→visit_count from AgentMemory.
-        visit_penalty: how much each prior visit adds to the cost (0 = pure D* Lite).
-        A small penalty (e.g. 0.05) nudges D* Lite toward less-visited cells when
-        path costs are tied or very close, encouraging exploration without sacrificing
-        optimality on clearly shorter paths.
-        """
         self.s_start = current_pos
         self.compute_shortest_path()
         if self.g[self.s_start] == self.INF:
@@ -508,6 +546,10 @@ class EvolutionaryAgent:
         self.memory      = AgentMemory(persist=persist_memory)
         self.dstar       = DStarLite(self.start_cell, self.goal_cell, GRID_SIZE)
 
+        # Set to True when running v3 weights to restore legacy behavior.
+        # False (default) = v4 fire-rotation-aware mode.
+        self.legacy_pit_walls: bool = False
+
         self.current_pos      = self.start_cell
         self.prev_pos         = None
         self.last_action      = None
@@ -515,7 +557,7 @@ class EvolutionaryAgent:
         self._fire_wait_count = 0
         self.goal_reached     = False
 
-        self.env = None  # MazeEnvironment injected at runtime
+        self.env = None
         self._current_fire_cache: frozenset = frozenset()
         self._last_fire_rot_idx:  int       = -1
 
@@ -529,19 +571,31 @@ class EvolutionaryAgent:
         return self._current_fire_cache
 
     def _turns_until_clear(self, r, c) -> int:
-        """Exact turns until (r,c) is not on fire. 0=clear now, 4=permanent."""
+        cur_idx = getattr(self.env, "_fire_rot_idx", 0) if self.env else 0
+        # Use learned rotation mask if available (more reliable post-death)
+        learned = self.memory.cell_rotation_mask.get((r, c))
+        if learned is not None:
+            for wait in range(4):
+                if (cur_idx + wait) % 4 not in learned:
+                    return wait
+            return 4
         if self.env is None: return 0
-        cur_idx = getattr(self.env, "_fire_rot_idx", 0)
-        states  = getattr(self.env, "_fire_rotation_states", [self.env.death_pits]*4)
+        states = getattr(self.env, "_fire_rotation_states", [self.env.death_pits]*4)
         for wait in range(4):
             if (r, c) not in states[(cur_idx + wait) % 4]:
                 return wait
-        return 4   # all 4 rotation states have fire → permanent
+        return 4
 
     def _cell_clears_within(self, r, c, max_turns) -> bool:
+        cur_idx = getattr(self.env, "_fire_rot_idx", 0) if self.env else 0
+        learned = self.memory.cell_rotation_mask.get((r, c))
+        if learned is not None:
+            for wait in range(max_turns + 1):
+                if (cur_idx + wait) % 4 not in learned:
+                    return True
+            return False
         if self.env is None: return True
-        cur_idx = getattr(self.env, "_fire_rot_idx", 0)
-        states  = getattr(self.env, "_fire_rotation_states", [self.env.death_pits]*4)
+        states = getattr(self.env, "_fire_rotation_states", [self.env.death_pits]*4)
         for wait in range(max_turns + 1):
             if (r, c) not in states[(cur_idx + wait) % 4]:
                 return True
@@ -553,49 +607,67 @@ class EvolutionaryAgent:
             if last_result.is_dead:
                 self.current_pos = self.start_cell
                 self._fire_wait_count = 0
+                # Learn the full fire cluster from this death
+                if self.env is not None and self.prev_pos is not None:
+                    death_cell = last_result.current_position
+                    fire_states = getattr(self.env, "_fire_rotation_states", None)
+                    rot_idx     = getattr(self.env, "_fire_rot_idx", 0)
+                    if fire_states:
+                        cluster_walls = self.memory.learn_fire_cluster(
+                            death_cell, fire_states, rot_idx)
+                        if cluster_walls:
+                            new_walls |= cluster_walls
             else:
                 self.current_pos = last_result.current_position
             if self.last_action is not None:
                 new_walls = self.memory.update(
                     self.prev_pos, self.last_action,
                     last_result, self.last_intended,
-                    goal_cell=self.goal_cell)
+                    goal_cell=self.goal_cell,
+                    legacy_pit_walls=self.legacy_pit_walls)
 
         if new_walls:
             self.dstar.notify_new_walls(new_walls)
 
-        # Sync newly discovered teleporters into D* Lite so it can route through them
         new_tps = {k: v for k, v in self.memory.known_teleports.items()
                    if k not in self.dstar.known_teleports}
         if new_tps:
             self.dstar.notify_new_teleports(new_tps)
 
         current_fire = self._current_fire
-
         fire_rot_idx = getattr(self.env, "_fire_rot_idx", 0) if self.env else 0
         r2, c2       = self.current_pos
 
-        # ── Step 1: Mask — only discovered obstacles ──────────────────────────
-        # Only walls and pits the agent has physically discovered are masked.
-        # Fire cells are NOT pre-masked: the agent must learn to avoid them
-        # through experience, as required by the spec (§3.1.1, §4.1.2).
+        # ── Step 1: Mask ──────────────────────────────────────────────────────
         mask = np.ones(len(ACTION_MAP), dtype=np.float32)
         for ai, (dr, dc) in enumerate(DIRECTIONS):
             nr, nc = r2+dr, c2+dc
-            if ((r2, c2, dr, dc) in self.memory.known_walls
-                    or (nr, nc) in self.memory.known_pits):
+            if (r2, c2, dr, dc) in self.memory.known_walls:
                 mask[ai] = 0.0
+            elif (nr, nc) in self.memory.known_pits:
+                if self.legacy_pit_walls:
+                    mask[ai] = 0.0
+                else:
+                    learned = self.memory.cell_rotation_mask.get((nr, nc))
+                    if learned is not None:
+                        # Use precise rotation knowledge: block only when fire
+                        # is currently there according to learned mask
+                        cur_rot = getattr(self.env, "_fire_rot_idx", 0) if self.env else 0
+                        if cur_rot in learned:
+                            mask[ai] = 0.0
+                        # if current rotation is NOT in learned mask → cell is clear, allow crossing
+                    else:
+                        # No cluster knowledge yet — fall back to current fire state
+                        if (nr, nc) in current_fire:
+                            mask[ai] = 0.0
 
-        # ── Step 2: D* Lite — primary navigator with soft visit-count penalty ──
-        # visit_penalty > 0 during high-epsilon turns: nudges D* Lite away from
-        # heavily-visited cells, diversifying paths across episodes without
-        # overriding clear shortcuts (penalty is tiny vs real path cost differences).
+        # ── Step 2: D* Lite ───────────────────────────────────────────────────
         visit_pen    = 0.05 if self.epsilon > 0.10 else 0.0
         dstar_action = self.dstar.next_action(self.current_pos,
                                               visit_counts=self.memory.visit_count,
                                               visit_penalty=visit_pen)
 
-        # ── Step 3: Is transient fire blocking D* Lite's next cell? ──────────
+        # ── Step 3: Is D* Lite's next cell currently on fire? ─────────────────
         fire_blocked = False
         fire_nr = fire_nc = None
         if dstar_action is not None and dstar_action in MOVE_ACTIONS:
@@ -605,15 +677,12 @@ class EvolutionaryAgent:
             if (fire_nr, fire_nc) in current_fire:
                 fire_blocked = True
 
-        # ── Step 4: Choose intended action ───────────────────────────────────
+        # ── Step 4: Choose intended action ────────────────────────────────────
         if not fire_blocked:
             self._fire_wait_count = 0
             if dstar_action is not None:
                 d_idx = MOVE_ACTIONS.index(dstar_action)
                 if mask[d_idx] > 0:
-                    # Exploration override: small random chance to deviate from D* Lite.
-                    # Lets the agent discover off-path teleporters during training/test.
-                    # Rate is epsilon/10 so it rarely interferes with goal-directed nav.
                     if self.epsilon > 0 and random.random() < self.epsilon * 0.10:
                         valid = [ai for ai in range(len(DIRECTIONS)) if mask[ai] > 0]
                         intended = ACTION_MAP[random.choice(valid)] if valid else dstar_action
@@ -623,20 +692,19 @@ class EvolutionaryAgent:
                     valid = [ai for ai in range(len(DIRECTIONS)) if mask[ai] > 0]
                     intended = ACTION_MAP[random.choice(valid)] if valid else Action.WAIT
             else:
-                valid = [ai for ai in range(len(DIRECTIONS)) if mask[ai] > 0]
-                intended = ACTION_MAP[random.choice(valid)] if valid else Action.WAIT
+                # No D* Lite path — hunt for a beneficial teleporter
+                tp_action = self._hunt_teleporter()
+                if tp_action is not None and mask[MOVE_ACTIONS.index(tp_action)] > 0:
+                    intended = tp_action
+                else:
+                    valid = [ai for ai in range(len(DIRECTIONS)) if mask[ai] > 0]
+                    intended = ACTION_MAP[random.choice(valid)] if valid else Action.WAIT
 
         else:
-            # Fire blocking D* Lite's path — two cases:
-            #   Transient fire (clears within MAX_FIRE_WAIT): NN decides wait vs detour.
-            #   Permanent fire (never clears): follow D* Lite, accept death.
-            #      memory.update() registers the pit; D* Lite replans next turn.
-            #      This is how the spec intends hazard discovery to work (SS4.1.2).
-
             if self._cell_clears_within(fire_nr, fire_nc, MAX_FIRE_WAIT):
-                # Transient fire: NN decides timing with fire-wait hint
-                wait_needed     = self._turns_until_clear(fire_nr, fire_nc)
-                fire_wait_hint  = wait_needed / 3.0
+                # Transient fire: NN decides wait vs detour
+                wait_needed    = self._turns_until_clear(fire_nr, fire_nc)
+                fire_wait_hint = wait_needed / 3.0
                 state    = self.encoder.encode(self.current_pos, self.memory,
                                                current_fire, fire_rot_idx,
                                                dstar_hint=dstar_action,
@@ -647,18 +715,14 @@ class EvolutionaryAgent:
                     probs = masked_p / masked_p.sum()
 
                 if self.epsilon > 0 and random.random() < self.epsilon:
-                    # Reference: wait exactly until fire clears, then follow D* Lite
                     if self._fire_wait_count < wait_needed:
                         self._fire_wait_count += 1
                         intended = Action.WAIT
                     else:
-                        # Fire is now clear — step through it
                         self._fire_wait_count = 0
                         intended = dstar_action
                 else:
                     intended = ACTION_MAP[int(np.argmax(probs))]
-                    # Guard: prevent NN from accidentally entering active transient fire
-                    # (would register it as a permanent pit — wrong for rotating cells)
                     if intended in MOVE_ACTIONS:
                         ti = MOVE_ACTIONS.index(intended)
                         tdr, tdc = DIRECTIONS[ti]
@@ -666,16 +730,14 @@ class EvolutionaryAgent:
                             self._fire_wait_count += 1
                             intended = Action.WAIT
             else:
-                # Permanent fire — step into it to learn it's a pit.
-                # But ONLY if we don't already know it: re-dying on a known pit
-                # just wastes turns and score. If it's already known, D* Lite
-                # should have been given wall info; pick any valid direction instead.
+                # Permanent fire (pivot cell — fire in all 4 states)
                 self._fire_wait_count = 0
                 if (fire_nr, fire_nc) not in self.memory.known_pits:
-                    intended = dstar_action   # first encounter: die and learn
+                    intended = dstar_action   # first encounter: step in, die, learn
                 else:
-                    # Already know this pit. D* Lite is confused (no walls seeded).
-                    # Force register walls now so it replans correctly next turn.
+                    # Already known permanent pit — seed D* Lite walls so it
+                    # replans around it.  Unlike rotating pits (which clear and
+                    # can be crossed), permanent pits are true obstacles.
                     pr, pc = fire_nr, fire_nc
                     extra_walls: Set[Tuple] = set()
                     for edr, edc in DIRECTIONS:
@@ -687,14 +749,54 @@ class EvolutionaryAgent:
                                 extra_walls.add(wk)
                     if extra_walls:
                         self.dstar.notify_new_walls(extra_walls)
+                    # Now D* Lite will replan around it next turn;
+                    # pick any valid direction for this turn
                     valid = [ai for ai in range(len(DIRECTIONS)) if mask[ai] > 0]
                     intended = ACTION_MAP[random.choice(valid)] if valid else Action.WAIT
 
-        # ── Step 5: Confusion inversion (physics constraint) ──────────────────
+        # ── Step 5: Confusion inversion ───────────────────────────────────────
         actual = INVERT_MAP[intended] if self.memory.is_confused else intended
         self.prev_pos = self.current_pos
         self.last_action = actual; self.last_intended = intended
         return [actual]
+
+    def _hunt_teleporter(self) -> Optional[Action]:
+        """BFS toward the nearest known teleporter that reduces Manhattan distance to goal."""
+        if not self.memory.known_teleports or self.goal_cell is None:
+            return None
+        cur_dist = (abs(self.goal_cell[0]-self.current_pos[0]) +
+                    abs(self.goal_cell[1]-self.current_pos[1]))
+        targets = [
+            src for src, dst in self.memory.known_teleports.items()
+            if (abs(self.goal_cell[0]-dst[0]) + abs(self.goal_cell[1]-dst[1])) < cur_dist
+            and src not in self.memory.known_pits
+        ]
+        if not targets:
+            return None
+        visited = {self.current_pos: None}
+        queue = deque([self.current_pos])
+        found = None
+        while queue and found is None:
+            r, c = queue.popleft()
+            for ai, (dr, dc) in enumerate(DIRECTIONS):
+                nr, nc = r+dr, c+dc
+                if not (0 <= nr < GRID_SIZE and 0 <= nc < GRID_SIZE): continue
+                if (r, c, dr, dc) in self.memory.known_walls: continue
+                if (nr, nc) in self.memory.known_pits: continue
+                if (nr, nc) in visited: continue
+                visited[(nr, nc)] = ((r, c), ACTION_MAP[ai])
+                if (nr, nc) in targets:
+                    found = (nr, nc); break
+                queue.append((nr, nc))
+        if found is None:
+            return None
+        node = found
+        while visited[node] is not None:
+            parent, action = visited[node]
+            if parent == self.current_pos:
+                return action
+            node = parent
+        return None
 
     def reset_episode(self):
         self.memory.reset_episode()
@@ -711,7 +813,7 @@ class EvolutionaryAgent:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Fitness Functions  (tighter turn penalty: 50 per turn)
+# 6. Fitness Functions
 # ─────────────────────────────────────────────────────────────────────────────
 def _fitness_explore(goal_reached, turns, deaths, wall_hits, unique_cells, gc):
     if not unique_cells:
@@ -740,9 +842,9 @@ def _fitness_optimize(goal_reached, turns, deaths, wall_hits, unique_cells, gc,
                       phase_blend=1.0):
     if goal_reached:
         opt  = 500_000
-        opt -= 50    * turns      # tighter: 10k-turn solve scores 0, 5k = 250k
-        opt -= 500   * deaths     # reduced: first-encounter pit deaths unavoidable
-        opt -= 20    * wall_hits
+        opt -= 50  * turns
+        opt -= 500 * deaths
+        opt -= 20  * wall_hits
     else:
         min_dist = (min(abs(gc[0]-r)+abs(gc[1]-c) for r,c in unique_cells)
                     if unique_cells else 2*(GRID_SIZE-1))
@@ -765,6 +867,7 @@ ACTION_SYMBOLS = {
 def evaluate_fitness(controller, env, goal_cell=None, start_cell=None,
                      episodes=1, max_turns=10_000, epsilon=0.05,
                      persist=False, seed_pits=None, seed_walls=None,
+                     seed_teleports=None, legacy_pit_walls=False,
                      verbose=False, step_q=None,
                      step_interval=50, phase=PHASE_EXPLORE,
                      early_stop=True):
@@ -780,12 +883,10 @@ def evaluate_fitness(controller, env, goal_cell=None, start_cell=None,
     else:
         fitness_fn = _fitness_explore
 
-    agent     = EvolutionaryAgent(controller, gc, sc, epsilon, persist)
-    agent.env = env
+    agent                  = EvolutionaryAgent(controller, gc, sc, epsilon, persist)
+    agent.env              = env
+    agent.legacy_pit_walls = legacy_pit_walls
 
-    # Pre-seed with collective knowledge from previous generations/episodes.
-    # With persist=True, _shared_pits/_shared_walls carry across all episodes.
-    # With persist=False, only the first episode gets the seeded knowledge.
     if seed_pits or seed_walls:
         pits  = set(seed_pits  or set())
         walls = set(seed_walls or set())
@@ -795,6 +896,14 @@ def evaluate_fitness(controller, env, goal_cell=None, start_cell=None,
         else:
             agent.memory.known_pits  = pits
             agent.memory.known_walls = walls
+
+    if seed_teleports:
+        tps = dict(seed_teleports)
+        if persist:
+            agent.memory._shared_teleports = tps
+        else:
+            agent.memory.known_teleports = tps
+
     total_fit = 0.0
 
     for ep in range(episodes):
@@ -806,7 +915,7 @@ def evaluate_fitness(controller, env, goal_cell=None, start_cell=None,
         turns = deaths = wall_hits = 0
         goal_reached = False
         unique_cells: set = {sp}
-        last_new_cell_turn = 0   # early stopping: track last time we found a new cell
+        last_new_cell_turn = 0
 
         if verbose:
             print(f"\n  ── Episode {ep+1}/{episodes}  start={sp}  goal={gc}"
@@ -823,9 +932,6 @@ def evaluate_fitness(controller, env, goal_cell=None, start_cell=None,
             if len(unique_cells) > prev_size:
                 last_new_cell_turn = turns
 
-            # Early stopping: if stuck for 300 turns with no new cells, abort.
-            # Solvers and actively exploring agents are never affected.
-            # Only kills genuinely stuck individuals, saving ~minutes per gen.
             if early_stop and not verbose and turns - last_new_cell_turn > 300:
                 break
 
@@ -881,7 +987,6 @@ def evaluate_fitness(controller, env, goal_cell=None, start_cell=None,
 
         total_fit += ep_fit
 
-    # Store episode stats on agent so callers can compute performance metrics
     agent.total_wall_hits = wall_hits
     agent.total_turns     = turns
     return total_fit / episodes, agent
