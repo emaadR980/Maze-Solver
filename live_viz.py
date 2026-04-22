@@ -111,10 +111,12 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
             # Collective pit memory: once any agent dies on a fire pit, all
             # subsequent agents this generation start knowing about it.
             # Knowledge still comes from real deaths — spec compliant (SS4.1.2).
-            gen_shared_pits:  set = set(self.persistent_pits)
-            gen_shared_walls: set = set(self.persistent_walls)
+            gen_shared_pits:       set  = set(self.persistent_pits)
+            gen_shared_walls:      set  = set(self.persistent_walls)
+            gen_shared_teleports:  dict = dict(self.persistent_teleports)
 
             for i, ctrl in enumerate(self.population):
+                _is_immigrant = i in getattr(self, "_immigrant_indices", set())
                 fit, ep_agent = evaluate_fitness(
                     ctrl, env,
                     goal_cell=ma.GOAL_CELL, start_cell=ma.START_CELL,
@@ -122,6 +124,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
                     epsilon=epsilon, persist=persist,
                     seed_pits=gen_shared_pits,
                     seed_walls=gen_shared_walls,
+                    seed_teleports=None if _is_immigrant else gen_shared_teleports,
                     phase=self.phase, step_q=None,
                 )
                 self.fitness[i] = fit
@@ -132,11 +135,13 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
 
                 # Accumulate pit AND wall discoveries for remaining agents
                 if persist and hasattr(ep_agent.memory, '_shared_pits'):
-                    gen_shared_pits  |= ep_agent.memory._shared_pits
-                    gen_shared_walls |= ep_agent.memory._shared_walls
+                    gen_shared_pits        |= ep_agent.memory._shared_pits
+                    gen_shared_walls       |= ep_agent.memory._shared_walls
+                    gen_shared_teleports.update(ep_agent.memory._shared_teleports)
                 else:
                     gen_shared_pits  |= ep_agent.memory.known_pits
                     gen_shared_walls |= ep_agent.memory.known_walls
+                    gen_shared_teleports.update(ep_agent.memory.known_teleports)
 
                 # Cumulative map: every cell ever visited by any agent, ever
                 self.cumulative_cell_set.update(ep_agent.memory.visit_count.keys())
@@ -272,8 +277,9 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
             except _queue.Full:
                 pass
 
-            self.persistent_pits  = set(gen_shared_pits)
-            self.persistent_walls = set(gen_shared_walls)
+            self.persistent_pits       = set(gen_shared_pits)
+            self.persistent_walls      = set(gen_shared_walls)
+            self.persistent_teleports  = dict(gen_shared_teleports)
 
             self._maybe_switch_phase(gen_solvers, env=env)
 
@@ -291,8 +297,10 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
 
             n_immigrants = max(1, int(self.immigrant_frac * self.pop_size))
             inject_start = max(elite_k, self.pop_size - n_immigrants)
+            self._immigrant_indices = set()
             for k in range(self.pop_size - inject_start):
                 new_pop[inject_start + k] = NeuralController(self.layer_sizes)
+                self._immigrant_indices.add(inject_start + k)
 
             self.population = new_pop
             self.mut_sigma  = max(self.min_mut_sigma, self.mut_sigma * self.mut_decay)
@@ -311,6 +319,8 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
     ga.last_recorded_best     = -float("inf")
     ga.persistent_pits        = set()
     ga.persistent_walls       = set()
+    ga.persistent_teleports   = dict()
+    ga._immigrant_indices     = set()   # tagged each gen after pop rebuild
     ga.cumulative_cell_set    = set()   # all cells ever visited by any agent
 
     print(f"[GA]  {ga.pop_size} individuals × "
@@ -324,6 +334,24 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
     weights_file = f"weights_{run_id}.npy"
     alias_file   = f"best_weights_{run_id}.npy"
     print(f"[TRAIN] weights → {weights_file}  (alias → {alias_file})\n")
+
+    # Warm-start: seed population from existing weights + mutations.
+    # Agents inherit navigation skills from a previous maze; they still
+    # need to discover this maze's specific layout from scratch.
+    _init_w = args_dict.get("init_weights")
+    if _init_w:
+        try:
+            import numpy as _np
+            flat = _np.load(_init_w)
+            if flat.size == ga.population[0].num_params:
+                for ind in ga.population:
+                    ind.set_flat_weights(flat.copy())
+                    ga._mutate(ind, mutation_rate=0.15)
+                print(f"[WARM-START] population seeded from {_init_w}")
+            else:
+                print(f"[WARM-START] skipped — param mismatch ({flat.size} vs {ga.population[0].num_params})")
+        except Exception as _e:
+            print(f"[WARM-START] failed: {_e}")
 
     epsilon   = 0.70   # D* Lite handles 70% of turns; NN handles fire timing
     for gen_i in range(args_dict["gens"]):
@@ -647,6 +675,7 @@ def _run_test_direct(args, nav_name: str):
             seed_pits=seed_pits, seed_walls=seed_walls,
             phase=PHASE_OPTIMIZE,
             early_stop=False,
+            legacy_pit_walls=getattr(args, "legacy_pits", False),
             step_q=step_q, step_interval=DISPLAY_EVERY,
         )
 
@@ -1471,6 +1500,10 @@ def main():
     p.add_argument("--persist",  action="store_true")
     p.add_argument("--phase_k",  type=int,   default=3)
     p.add_argument("--run_id",   default=None)
+    p.add_argument("--init_weights", default=None,
+                   help="Warm-start population from these weights + mutations")
+    p.add_argument("--legacy_pits", action="store_true",
+                   help="Re-enable v3 pit-wall seeding (for backward compat)")
     args = p.parse_args()
     build_and_run(args, navigator_name="D* Lite")
 
