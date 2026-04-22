@@ -95,7 +95,7 @@ class CvTemplateHazards:
 
 # load templates from ./templates directory
 def load_templates_from_dir(template_dir="templates"):
-    labels = ["confusion", "death_pit", "teleport_orange", "teleport_green", "teleport_purple", "teleport_red"]
+    labels = ["confusion", "death_pit", "teleport_orange", "teleport_green", "teleport_purple", "teleport_red", "arrow_up", "arrow_left"]
     templates_by_label = {}
 
     for lab in labels:
@@ -144,6 +144,8 @@ class MazeLoader:
         self.teleport_orange = []
         self.teleport_green = []
         self.teleport_red = []
+        self.arrow_up = []
+        self.arrow_left = []
 
         self.bgr = cv2.cvtColor(self.rgb_array, cv2.COLOR_RGB2BGR)
 
@@ -275,6 +277,10 @@ class MazeLoader:
                     self.teleport_green.append((r, c))
                 elif lab == "teleport_red":
                     self.teleport_red.append((r, c))
+                elif lab == "arrow_up":
+                    self.arrow_up.append((r,c))
+                elif lab == "arrow_left":
+                    self.arrow_left.append((r,c))
 
         print(f"Found {detected} hazardous cells")
         return self.get_hazard_summary()
@@ -287,6 +293,8 @@ class MazeLoader:
             "teleport_orange": len(self.teleport_orange),
             "teleport_green": len(self.teleport_green),
             "teleport_red": len(self.teleport_red),
+            "arrow_up": len(self.arrow_up),
+            "arrow_left": len(self.arrow_left),
             "start_pos": self.start_pos,
             "goal_pos": self.goal_pos,
         }

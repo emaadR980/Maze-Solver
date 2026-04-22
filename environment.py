@@ -24,6 +24,7 @@ class TurnResult:
         self.is_goal_reached: bool = False
         self.teleported: bool = False
         self.actions_executed: int = 0
+        self.arrow_pushed: bool = False
 
     def __repr__(self):
         parts = [f"pos={self.current_position}"]
@@ -80,7 +81,8 @@ class MazeEnvironment:
         # Pass 1 — remove explicit overlap (colour-detected confusion pads)
         self.death_pits         -= self.confusion_pads
         print(f"[ENV] death_pits={len(self.death_pits)}"
-              f"  confusion_pads={len(self.confusion_pads)}")
+              f"  confusion_pads={len(self.confusion_pads)}"
+)
 
         self.initial_death_pits  = set(self.death_pits)
         self.fire_clusters = self.group_clusters(self.death_pits, max_gap=3)
@@ -88,12 +90,18 @@ class MazeEnvironment:
         self._fire_rotation_states = self._precompute_fire_states()
         self._fire_rot_idx = 0
 
+        # Arrow pads (must be before all_hazard_cells)
+        self.arrow_up   = set(map(tuple, getattr(self.loader, "arrow_up",   [])))
+        self.arrow_left = set(map(tuple, getattr(self.loader, "arrow_left", [])))
+        print(f"  arrow_up={len(self.arrow_up)}  arrow_left={len(self.arrow_left)}")
+
         all_hazard_cells = (
             self.death_pits | self.confusion_pads
             | set(map(tuple, self.loader.teleport_purple))
             | set(map(tuple, self.loader.teleport_orange))
             | set(map(tuple, self.loader.teleport_green))
-            | set(map(tuple, self.loader.teleport_red))
+            | set(map(tuple, getattr(self.loader, "teleport_red", [])))
+            | self.arrow_up | self.arrow_left
         )
         for r, c in all_hazard_cells:
             self.grid[r][c] = True
@@ -102,7 +110,7 @@ class MazeEnvironment:
         for group in [self.loader.teleport_purple,
                       self.loader.teleport_orange,
                       self.loader.teleport_green,
-                      self.loader.teleport_red]:
+                      getattr(self.loader, "teleport_red", [])]:
             pads = [tuple(p) for p in group]
             for i, pad in enumerate(pads):
                 dest = pads[(i + 1) % len(pads)] if len(pads) > 1 else pad
@@ -310,6 +318,24 @@ class MazeEnvironment:
                 self.agent_pos          = self.teleport_map[self.agent_pos]
                 result.teleported       = True
                 result.current_position = self.agent_pos
+
+            # Arrow pad: force one step in arrow direction
+            if self.agent_pos in self.arrow_up or self.agent_pos in self.arrow_left:
+                _ar, _ac = self.agent_pos
+                _fdr, _fdc = (-1, 0) if self.agent_pos in self.arrow_up else (0, -1)
+                _fnr, _fnc = _ar + _fdr, _ac + _fdc
+                if (_fnr, _fnc) in self.adj[_ar][_ac]:
+                    self.agent_pos = (_fnr, _fnc)
+                    self.cells_explored.add(self.agent_pos)
+                    result.arrow_pushed = True
+                    result.current_position = self.agent_pos
+                    # Hazard checks on landing cell still apply, then turn ends
+                    if self.agent_pos in self.death_pits:
+                        result.is_dead = True; self.death_count += 1
+                        self.agent_pos = self.start_cell
+                    elif self.agent_pos == self.goal_cell:
+                        result.is_goal_reached = True; self.episode_active = False
+                    break   # arrow uses full turn
 
             if self.agent_pos in self.confusion_pads:
                 result.is_confused       = True

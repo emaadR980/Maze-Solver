@@ -388,12 +388,17 @@ def _run_test_direct(args, nav_name: str):
     except Exception as e:
         print(f"[ERROR] {e}"); return
 
-    # Count total passable cells for map completeness metric
-    _total_passable = sum(
-        1 for _r in range(env.loader.maze_height_cells)
-        for _c in range(env.loader.maze_width_cells)
-        if env.adj[_r][_c]
-    )
+    # Count reachable cells via BFS from start — true navigable maze size
+    from collections import deque as _deque
+    _visited_bfs = {env.start_cell}
+    _bfs_q = _deque([env.start_cell])
+    while _bfs_q:
+        _br, _bc = _bfs_q.popleft()
+        for _nb in env.adj[_br][_bc]:
+            if _nb not in _visited_bfs:
+                _visited_bfs.add(_nb)
+                _bfs_q.append(_nb)
+    _total_passable = len(_visited_bfs)
     print(f"[TEST] maze={args.maze}  start={env.start_cell}  goal={env.goal_cell}")
     print(f"[TEST] {args.test_episodes} episodes  eps=0  (frozen)\n")
 
@@ -408,6 +413,8 @@ def _run_test_direct(args, nav_name: str):
     tp_orange    = [(r, c) for r, c in env.loader.teleport_orange]
     tp_green     = [(r, c) for r, c in env.loader.teleport_green]
     tp_red       = [(r, c) for r, c in getattr(env.loader, "teleport_red", [])]
+    arrow_up     = list(env.arrow_up)
+    arrow_left   = list(env.arrow_left)
     fire_rot     = [0]   # mutable for closure
     # Fallback: show any teleporter pads the loader colour-missed
     _tp_shown = set(map(tuple, env.loader.teleport_purple)) \
@@ -426,6 +433,20 @@ def _run_test_direct(args, nav_name: str):
     def _pagent(draw, r, c):
         _pdot(draw, r, c, (0, 0, 0), dr=6)
         _pdot(draw, r, c, (255, 255, 255), dr=4)
+
+
+    def _parrow(draw, r, c, direction):
+        """Draw a small directional arrow at cell (r,c). direction: 'up' or 'left'."""
+        x, y = _xy(r, c)
+        col = (0, 200, 255)  # cyan
+        if direction == 'up':
+            draw.line([(x, y+4), (x, y-4)], fill=col, width=2)
+            draw.line([(x, y-4), (x-3, y-1)], fill=col, width=2)
+            draw.line([(x, y-4), (x+3, y-1)], fill=col, width=2)
+        else:  # left
+            draw.line([(x+4, y), (x-4, y)], fill=col, width=2)
+            draw.line([(x-4, y), (x-1, y-3)], fill=col, width=2)
+            draw.line([(x-4, y), (x-1, y+3)], fill=col, width=2)
 
     def _ppath(draw, path):
         if not path:
@@ -470,6 +491,8 @@ def _run_test_direct(args, nav_name: str):
         for r, c in tp_green:  _pdot(draw, r, c, ( 30, 200,  70), 4)
         for r, c in tp_red:    _pdot(draw, r, c, (220,   0, 255), 4)
         for r, c in tp_extra:  _pdot(draw, r, c, (  0, 220, 220), 4)
+        for r, c in arrow_up:   _parrow(draw, r, c, "up")
+        for r, c in arrow_left: _parrow(draw, r, c, "left")
         _pdot(draw, *env.start_cell, (  0, 230, 100), 6)
         _pdot(draw, *env.goal_cell,  (  0, 220, 255), 7)
         for r, c in known_pits: _pdot(draw, r, c, (180,   0,   0), 4)
@@ -790,6 +813,8 @@ def _run_test_direct(args, nav_name: str):
         for r,c in tp_green:  _pdot(draw, r, c, ( 30,200, 70), 4)
         for r,c in tp_red:    _pdot(draw, r, c, (220,  0,255), 4)
         for r,c in tp_extra:  _pdot(draw, r, c, (  0,220,220), 4)
+        for r,c in arrow_up:   _parrow(draw, r, c, "up")
+        for r,c in arrow_left: _parrow(draw, r, c, "left")
         _pdot(draw, *env.start_cell, (  0,230,100), 6)
         _pdot(draw, *env.goal_cell,  (  0,220,255), 7)
         # Fire pits known at this episode
