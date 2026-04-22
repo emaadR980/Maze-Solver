@@ -18,7 +18,7 @@ import random
 from collections import defaultdict, deque
 from typing import List, Tuple, Dict, Optional, Set
 
-from environment import Action, TurnResult, MazeEnvironment
+from environment import Action, TurnResult
 
 GRID_SIZE  = 64
 START_CELL = (63, 31)
@@ -515,14 +515,14 @@ class EvolutionaryAgent:
         self._fire_wait_count = 0
         self.goal_reached     = False
 
-        self.env: Optional[MazeEnvironment] = None
+        self.env = None  # MazeEnvironment injected at runtime
         self._current_fire_cache: frozenset = frozenset()
         self._last_fire_rot_idx:  int       = -1
 
     @property
     def _current_fire(self) -> frozenset:
         if self.env is None: return frozenset()
-        rot_idx = self.env._fire_rot_idx
+        rot_idx = getattr(self.env, "_fire_rot_idx", 0)
         if rot_idx != self._last_fire_rot_idx:
             self._current_fire_cache = frozenset(self.env.death_pits)
             self._last_fire_rot_idx  = rot_idx
@@ -531,8 +531,8 @@ class EvolutionaryAgent:
     def _turns_until_clear(self, r, c) -> int:
         """Exact turns until (r,c) is not on fire. 0=clear now, 4=permanent."""
         if self.env is None: return 0
-        cur_idx = self.env._fire_rot_idx
-        states  = self.env._fire_rotation_states
+        cur_idx = getattr(self.env, "_fire_rot_idx", 0)
+        states  = getattr(self.env, "_fire_rotation_states", [self.env.death_pits]*4)
         for wait in range(4):
             if (r, c) not in states[(cur_idx + wait) % 4]:
                 return wait
@@ -540,8 +540,8 @@ class EvolutionaryAgent:
 
     def _cell_clears_within(self, r, c, max_turns) -> bool:
         if self.env is None: return True
-        cur_idx = self.env._fire_rot_idx
-        states  = self.env._fire_rotation_states
+        cur_idx = getattr(self.env, "_fire_rot_idx", 0)
+        states  = getattr(self.env, "_fire_rotation_states", [self.env.death_pits]*4)
         for wait in range(max_turns + 1):
             if (r, c) not in states[(cur_idx + wait) % 4]:
                 return True
@@ -572,7 +572,7 @@ class EvolutionaryAgent:
 
         current_fire = self._current_fire
 
-        fire_rot_idx = self.env._fire_rot_idx if self.env else 0
+        fire_rot_idx = getattr(self.env, "_fire_rot_idx", 0) if self.env else 0
         r2, c2       = self.current_pos
 
         # ── Step 1: Mask — only discovered obstacles ──────────────────────────
@@ -766,7 +766,8 @@ def evaluate_fitness(controller, env, goal_cell=None, start_cell=None,
                      episodes=1, max_turns=10_000, epsilon=0.05,
                      persist=False, seed_pits=None, seed_walls=None,
                      verbose=False, step_q=None,
-                     step_interval=50, phase=PHASE_EXPLORE):
+                     step_interval=50, phase=PHASE_EXPLORE,
+                     early_stop=True):
     import time as _time
     gc = goal_cell  or GOAL_CELL
     sc = start_cell or START_CELL
@@ -825,7 +826,7 @@ def evaluate_fitness(controller, env, goal_cell=None, start_cell=None,
             # Early stopping: if stuck for 300 turns with no new cells, abort.
             # Solvers and actively exploring agents are never affected.
             # Only kills genuinely stuck individuals, saving ~minutes per gen.
-            if not verbose and turns - last_new_cell_turn > 300:
+            if early_stop and not verbose and turns - last_new_cell_turn > 300:
                 break
 
             if turns % 50 == 0:

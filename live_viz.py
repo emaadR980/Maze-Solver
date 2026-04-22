@@ -81,7 +81,7 @@ def training_worker(maze_path: str, args_dict: dict, state_q: Queue):
             "teleport_purple":  list(map(list, env.loader.teleport_purple)),
             "teleport_orange":  list(map(list, env.loader.teleport_orange)),
             "teleport_green":   list(map(list, env.loader.teleport_green)),
-            "teleport_red":     list(map(list, env.loader.teleport_red)),
+            "teleport_red":     list(map(list, getattr(env.loader, "teleport_red", []))),
             "cell_size":        env.CELL_SIZE,
             "fire_rot_idx":     getattr(env, "_fire_rot_idx", 0),
         })
@@ -407,13 +407,13 @@ def _run_test_direct(args, nav_name: str):
     tp_purple    = [(r, c) for r, c in env.loader.teleport_purple]
     tp_orange    = [(r, c) for r, c in env.loader.teleport_orange]
     tp_green     = [(r, c) for r, c in env.loader.teleport_green]
-    tp_red       = [(r, c) for r, c in env.loader.teleport_red]
+    tp_red       = [(r, c) for r, c in getattr(env.loader, "teleport_red", [])]
     fire_rot     = [0]   # mutable for closure
     # Fallback: show any teleporter pads the loader colour-missed
     _tp_shown = set(map(tuple, env.loader.teleport_purple)) \
               | set(map(tuple, env.loader.teleport_orange))  \
               | set(map(tuple, env.loader.teleport_green))   \
-              | set(map(tuple, env.loader.teleport_red))
+              | set(map(tuple, getattr(env.loader, "teleport_red", [])))
     tp_extra  = [(r,c) for (r,c) in env.teleport_map if (r,c) not in _tp_shown]
 
     def _xy(r, c):
@@ -539,7 +539,7 @@ def _run_test_direct(args, nav_name: str):
         for i, r in enumerate(results):
             y     = hdr_y - 0.065 - i * row_h
             color = "#00e5aa" if r["solved"] else "#ff4466"
-            label = "✓ SOLVED" if r["solved"] else ("✗ DEATH" if r.get("died") else "✗ TIMEOUT")
+            label = "✓ SOLVED" if r["solved"] else "✗ TIMEOUT"
             vals  = [str(r["episode"]), label, str(r["turns"]),
                      str(r["deaths"]), str(r["explored"]), f"{r['fitness']:+.0f}"]
             tc    = ["#c8d0e0", color, "#c8d0e0",
@@ -623,6 +623,7 @@ def _run_test_direct(args, nav_name: str):
             epsilon=0.0, persist=True,
             seed_pits=seed_pits, seed_walls=seed_walls,
             phase=PHASE_OPTIMIZE,
+            early_stop=False,
             step_q=step_q, step_interval=DISPLAY_EVERY,
         )
 
