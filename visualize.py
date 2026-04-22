@@ -2,6 +2,7 @@ from PIL import Image, ImageDraw
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional, Dict
+import os
 
 _DOT_R = 3
 
@@ -166,3 +167,114 @@ class LiveVisualizer:
     def close(self):
         plt.ioff()
         plt.close(self.fig)
+
+
+class GifRenderer:
+    """Headless renderer — no matplotlib window. Accumulates PIL frames and saves per-episode GIFs.
+
+    Drop-in replacement for LiveVisualizer when you only want GIF output.
+
+    Args:
+        env:            MazeEnvironment instance.
+        capture_every:  Capture 1 frame every N calls to update(). Use >1 to shrink GIF size
+                        for long episodes (e.g. capture_every=3 at 8 fps → effectively 2.7 fps).
+    """
+
+    def __init__(self, env, capture_every: int = 1):
+        self.env = env
+        self.capture_every = max(1, capture_every)
+        self._painted: Image.Image = self._fresh_base_image()
+        self._last_paint_idx = 0
+        self._frames: List[Image.Image] = []
+        self._call_count = 0
+
+    def reset_episode(self, env=None) -> None:
+        if env:
+            self.env = env
+        self._painted = self._fresh_base_image()
+        self._last_paint_idx = 0
+        self._call_count = 0
+
+    def _fresh_base_image(self) -> Image.Image:
+        img = self.env.loader.img.copy().convert("RGB")
+        if getattr(self.env, "rotate_fire_enabled", False):
+            draw = ImageDraw.Draw(img)
+            cell = self.env.CELL_SIZE
+            fire_cells = set()
+            for cluster in getattr(self.env, "initial_fire_clusters", self.env.fire_clusters):
+                for r, c in cluster:
+                    if self.env.is_cell_in_bounds(r, c):
+                        fire_cells.add((r, c))
+            for r, c in fire_cells:
+                x0 = c * cell + 2
+                y0 = r * cell + 2
+                x1 = (c + 1) * cell - 2
+                y1 = (r + 1) * cell - 2
+                draw.rectangle([x0, y0, x1, y1], fill=(255, 255, 255))
+        return img
+
+    def update(
+        self,
+        known:       Dict[Tuple[int, int], str],
+        current_pos: Optional[Tuple[int, int]],
+        path:        List[Tuple[int, int]],
+        episode:     int,
+        turn:        int,
+        goal_pos:    Optional[Tuple[int, int]] = None,
+        start_pos:   Optional[Tuple[int, int]] = None,
+        extra_stats: Optional[Dict] = None,
+    ) -> None:
+        self._call_count += 1
+
+        draw = ImageDraw.Draw(self._painted)
+        new_segment = path[max(0, self._last_paint_idx - 1):]
+        _draw_path(draw, self.env, new_segment)
+        self._last_paint_idx = len(path)
+
+        if self._call_count % self.capture_every != 0:
+            return
+
+        display = self._painted.copy()
+        disp_draw = ImageDraw.Draw(display)
+
+        for (r, c), ct in known.items():
+            if ct == 'death' and getattr(self.env, "rotate_fire_enabled", False):
+                continue
+            col = _HAZARD_COLOUR.get(ct)
+            if col:
+                _dot(disp_draw, _cell_centre(self.env, r, c), col, r=_DOT_R + 1)
+
+        if start_pos:
+            _dot(disp_draw, _cell_centre(self.env, *start_pos), _START_COLOUR, r=5)
+        if goal_pos:
+            _dot(disp_draw, _cell_centre(self.env, *goal_pos), _GOAL_COLOUR, r=6)
+
+        rotating = set()
+        for cl in self.env.fire_clusters:
+            rotating.update(cl)
+        for r, c in self.env.death_pits:
+            color = _HAZARD_COLOUR['death_rotating'] if (r, c) in rotating else _HAZARD_COLOUR['death']
+            _dot(disp_draw, _cell_centre(self.env, r, c), color, r=_DOT_R + 2)
+        if current_pos:
+            _agent_dot(disp_draw, _cell_centre(self.env, *current_pos))
+
+        self._frames.append(display)
+
+    def save_episode_gif(self, path: str, fps: int = 8, loop: int = 0) -> None:
+        """Save accumulated frames as an animated GIF, then clear the buffer."""
+        if not self._frames:
+            print(f"  [gif] No frames to save for {path}")
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        duration_ms = max(1, int(1000 / fps))
+        self._frames[0].save(
+            path,
+            save_all=True,
+            append_images=self._frames[1:],
+            duration=duration_ms,
+            loop=loop,
+            optimize=False,
+        )
+        n = len(self._frames)
+        self._frames.clear()
+        print(f"  [gif] Saved {path}  ({n} frames @ {fps} fps)")

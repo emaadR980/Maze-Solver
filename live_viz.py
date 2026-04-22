@@ -599,6 +599,11 @@ def _run_test_direct(args, nav_name: str):
 
     # ── Episode loop — mirrors training: evaluate_fitness + accumulated seeds ──
     import queue as _lq
+    import os as _os
+
+    gif_dir   = getattr(args, "gif_dir",   None)
+    gif_fps   = getattr(args, "gif_fps",   8)
+    gif_every = getattr(args, "gif_every", 50)
 
     results            = []
     death_positions    = []  # (r, c, ep) cumulative
@@ -607,7 +612,7 @@ def _run_test_direct(args, nav_name: str):
     seed_walls: set    = set()
     cumulative_explored: set = set()  # unique cells ever visited across all episodes
 
-    DISPLAY_EVERY = 100
+    DISPLAY_EVERY = gif_every if gif_dir else 100
 
     for ep in range(args.test_episodes):
         _reset_painted()
@@ -669,12 +674,14 @@ def _run_test_direct(args, nav_name: str):
               f"  explored={ep_stats['cells_explored']}"
               f"  pits_known={len(seed_pits)}  fitness={fit:+.0f}")
 
-        last_path = list(agent.memory.path[-2000:])
+        last_path     = list(agent.memory.path[-2000:])
+        gif_step_msgs = []
         while True:
             try:
                 msg = step_q.get_nowait()
                 if "agent_path" in msg:
                     last_path = msg["agent_path"]
+                    gif_step_msgs.append(msg)
             except _lq.Empty:
                 break
 
@@ -689,6 +696,32 @@ def _run_test_direct(args, nav_name: str):
             f"  deaths={ep_stats['deaths']}")
         fig.canvas.draw_idle()
         plt.pause(0.2)
+
+        # ── Per-episode GIF export ─────────────────────────────────────────────
+        if gif_dir and gif_step_msgs:
+            _os.makedirs(gif_dir, exist_ok=True)
+            _maze_name = _os.path.splitext(_os.path.basename(args.maze))[0]
+            _gif_path  = _os.path.join(gif_dir, f"{_maze_name}_ep{ep+1:02d}.gif")
+            _reset_painted()          # fresh base for incremental GIF rendering
+            _gif_frames = []
+            for _msg in gif_step_msgs:
+                _frame = _compose(_msg["agent_path"], _msg["agent_pos"],
+                                  seed_pits, death_positions)
+                _gif_frames.append(_PIL.fromarray(_frame))
+            # Always include the final state
+            _gif_frames.append(_PIL.fromarray(
+                _compose(list(agent.memory.path), agent.current_pos,
+                         seed_pits, death_positions)))
+            _dur = max(1, int(1000 / gif_fps))
+            _gif_frames[0].save(
+                _gif_path,
+                save_all=True,
+                append_images=_gif_frames[1:],
+                duration=_dur,
+                loop=0,
+                optimize=False,
+            )
+            print(f"  [gif] Saved {_gif_path}  ({len(_gif_frames)} frames @ {gif_fps} fps)")
 
         _reset_painted()
 
@@ -1446,6 +1479,12 @@ def main():
     p.add_argument("--persist",  action="store_true")
     p.add_argument("--phase_k",  type=int,   default=3)
     p.add_argument("--run_id",   default=None)
+    p.add_argument("--gif_dir",   default=None,
+                   help="Save one animated GIF per episode to this folder (--test only)")
+    p.add_argument("--gif_fps",   type=int, default=8,
+                   help="GIF playback speed in frames per second (default: 8)")
+    p.add_argument("--gif_every", type=int, default=50,
+                   help="Capture one GIF frame every N agent turns (default: 50)")
     args = p.parse_args()
     build_and_run(args, navigator_name="D* Lite")
 
