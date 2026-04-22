@@ -1,3 +1,4 @@
+import sys
 from enum import Enum
 from typing import List, Tuple, Optional
 from maze import MazeLoader
@@ -21,6 +22,8 @@ class TurnResult:
         self.is_goal_reached: bool = False
         self.teleported: bool = False
         self.actions_executed: int = 0
+        self.positions_visited: List[Tuple[int, int]] = []  # every position after each action
+        self.last_event: str = ""  # human-readable description of the last hazard that fired
 
     def __repr__(self):
         parts = [f"pos={self.current_position}"]
@@ -54,7 +57,7 @@ class MazeEnvironment:
         Action.WAIT: Action.WAIT,
     }
 
-    def __init__(self, maze_image_path: str):
+    def __init__(self, maze_image_path: str, rotate_fire: bool = False):
         self.loader = MazeLoader(maze_image_path)
         self.loader.detect_hazards()
 
@@ -69,51 +72,59 @@ class MazeEnvironment:
                 px = min(px, self.loader.maze_array.shape[1] - 1)
                 self.grid[r][c] = bool(self.loader.maze_array[py, px])
 
-        # convert pixel start/goal to cell coords
-        sp = self.loader.start_pos # (pixel_y, pixel_x)
+        sp = self.loader.start_pos
         gp = self.loader.goal_pos
         self.start_cell = self.loader.pixel_to_cell(sp[0], sp[1])
         self.goal_cell = self.loader.pixel_to_cell(gp[0], gp[1])
 
-        # hazard sets cell coords as tuples for fast lookup
         self.death_pits = set(map(tuple, self.loader.death_pits))
         self.initial_death_pits = set(self.death_pits)
-        # store clusters of fire pits to rotate together
         self.fire_clusters: List[List[Tuple[int, int]]] = self.group_clusters(self.death_pits)
+        self.fire_cluster_pivots: List[Tuple[int, int]] = [
+            self.cluster_orientation_and_pivot(cluster)[1]
+            for cluster in self.fire_clusters
+        ]
+        self.fire_clusters = [
+            self.complete_edge_fire_cluster(cluster, pivot)
+            for cluster, pivot in zip(self.fire_clusters, self.fire_cluster_pivots)
+        ]
         self.initial_fire_clusters = [list(cluster) for cluster in self.fire_clusters]
+        self.initial_fire_cluster_pivots = list(self.fire_cluster_pivots)
         self.confusion_pads = set(map(tuple, self.loader.confusion_pads))
 
-        # hazard cells contain colored emojis so dark pixels make them appear as walls in grayscale
-        # so force all detected hazards to be passbable
         all_hazard_cells = (
             self.death_pits
             | self.confusion_pads
             | set(map(tuple, self.loader.teleport_purple))
             | set(map(tuple, self.loader.teleport_orange))
             | set(map(tuple, self.loader.teleport_green))
+            | set(map(tuple, self.loader.teleport_red))
         )
         for r, c in all_hazard_cells:
             self.grid[r][c] = True
 
-        # teleport pads group by color pair[0] -> pair[1] destination
         self.teleport_map: dict = {}
-        for group in [self.loader.teleport_purple, self.loader.teleport_orange, self.loader.teleport_green]:
+        for group in [self.loader.teleport_purple, self.loader.teleport_orange, self.loader.teleport_green, self.loader.teleport_red]:
             pads = [tuple(p) for p in group]
-            for i, pad in enumerate(pads):
-                dest = pads[(i + 1) % len(pads)] if len(pads) > 1 else pad
-                self.teleport_map[pad] = dest
+            for i in range(0, len(pads) - 1, 2):
+                self.teleport_map[pads[i]]     = pads[i + 1]
+                self.teleport_map[pads[i + 1]] = pads[i]
+            if len(pads) % 2 == 1:          # unpaired pad → maps to itself (no-op)
+                self.teleport_map[pads[-1]] = pads[-1]
 
         # episode state
         self.agent_pos: Tuple[int, int] = self.start_cell
         self.turn_count: int  = 0
         self.death_count: int  = 0
         self.confused_count: int  = 0
+        self.teleport_count: int  = 0
         self.confused_turns_left: int = 0   # turns of confusion remaining
         self.cells_explored: set  = set()
         self.episode_active: bool = True
+        self.freeze_fire: bool = False   # set True during demo navigation to pause rotation
+        self.rotate_fire_enabled: bool = rotate_fire
 
-    def group_clusters(self, cells: set, max_gap: int = 8) -> List[List[Tuple[int, int]]]:
-        # group cells into clusters using BFS where neighbors are within max_gap in both row and col
+    def group_clusters(self, cells: set, max_gap: int = 1) -> List[List[Tuple[int, int]]]:
         remaining = set(cells)
         clusters = []
         while remaining:
@@ -132,15 +143,6 @@ class MazeEnvironment:
         return clusters
 
     def cluster_orientation_and_pivot(self, cluster: List[Tuple[int, int]]) -> Tuple[str, Tuple[int, int]]:
-        # v : bottom row has the single tip cell
-        # ^ : top row has the single tip cell
-        # < : left column has the single tip cell
-        # > : right column has the single tip cell
-
-        # count how many cells in the cluster are in each row and column
-        # if the cluster is wider than it is tall, orientation is vertical and tip is in row with fewest cells
-        # if the cluster is taller than it is wide, orientation is horizontal and tip is in column with fewest cells
-    
         rows = [r for r, _ in cluster]
         cols = [c for _, c in cluster]
 
@@ -156,8 +158,6 @@ class MazeEnvironment:
         width = max_c - min_c + 1
         height = max_r - min_r + 1
 
-        # if cluster is wider than tall, orientation is vertical and tip is in row with fewest cells
-        # else orientation is horizontal and tip is in column with fewest cells
         if width >= height:
             if row_counts.get(max_r, 0) <= row_counts.get(min_r, 0):
                 pivot_candidates = [cell for cell in cluster if cell[0] == max_r]
@@ -165,20 +165,41 @@ class MazeEnvironment:
             pivot_candidates = [cell for cell in cluster if cell[0] == min_r]
             return "^", min(pivot_candidates, key=lambda cell: abs(cell[1] - sum(cols) / len(cols)))
 
-        # if left column has fewer cells than right column, orientation is horizontal and tip is in left column, else tip is in right column
-        if col_counts.get(min_c, 0) <= col_counts.get(max_c, 0): # 
+        if col_counts.get(min_c, 0) <= col_counts.get(max_c, 0):
             pivot_candidates = [cell for cell in cluster if cell[1] == min_c]
             return "<", min(pivot_candidates, key=lambda cell: abs(cell[0] - sum(rows) / len(rows)))
         
         pivot_candidates = [cell for cell in cluster if cell[1] == max_c]
         return ">", min(pivot_candidates, key=lambda cell: abs(cell[0] - sum(rows) / len(rows)))
 
-    # rotate ONE cluster 90 deg clockwise around tip of v and dont draw pits outside of maze 
-    def rotate_fire_cluster(self, cluster: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        h = self.loader.maze_height_cells
-        w = self.loader.maze_width_cells
+    def complete_edge_fire_cluster(self, cluster: List[Tuple[int, int]],
+                                   pivot: Tuple[int, int]) -> List[Tuple[int, int]]:
+        if not any(
+            r == 0 or c == 0
+            or r == self.loader.maze_height_cells - 1
+            or c == self.loader.maze_width_cells - 1
+            for r, c in cluster
+        ):
+            return sorted(set(cluster))
 
-        _orientation, pivot = self.cluster_orientation_and_pivot(cluster)
+        pr, pc = pivot
+        completed = set(cluster)
+
+        if any(c == 0 for r, c in cluster):
+            for k in range(1, 4):
+                completed.add((pr - k, pc - k))
+        else:
+            for r, c in cluster:
+                reflected = (2 * pr - r, 2 * pc - c)
+                if not self.is_cell_in_bounds(*reflected):
+                    completed.add(reflected)
+
+        return sorted(completed)
+
+    def rotate_fire_cluster(self, cluster: List[Tuple[int, int]],
+                            pivot: Optional[Tuple[int, int]] = None) -> List[Tuple[int, int]]:
+        if pivot is None:
+            _orientation, pivot = self.cluster_orientation_and_pivot(cluster)
         pr, pc = pivot
 
         rotated = []
@@ -188,16 +209,23 @@ class MazeEnvironment:
             dc = c - pc
             nr = pr + dc
             nc = pc - dr
-            if 0 <= nr < h and 0 <= nc < w:
-                cell = (nr, nc)
-                if cell not in seen:
-                    seen.add(cell)
-                    rotated.append(cell)
+            cell = (nr, nc)
+            if cell not in seen:
+                seen.add(cell)
+                rotated.append(cell)
 
         return sorted(rotated)
 
+    def is_cell_in_bounds(self, r: int, c: int) -> bool:
+        return (
+            0 <= r < self.loader.maze_height_cells
+            and 0 <= c < self.loader.maze_width_cells
+        )
+
     # rotate all clusters
-    def rotate_fire_clusters(self): 
+    def rotate_fire_clusters(self):
+        if self.freeze_fire:
+            return
         # restore original passability for old pit cells
         for r, c in self.death_pits:
             py = r * self.CELL_SIZE + self.CELL_SIZE // 2
@@ -208,62 +236,131 @@ class MazeEnvironment:
 
         new_clusters = []
         new_death_pits = set()
-        for cluster in self.fire_clusters:
-            rotated = self.rotate_fire_cluster(cluster)
+        for cluster, pivot in zip(self.fire_clusters, self.fire_cluster_pivots):
+            rotated = self.rotate_fire_cluster(cluster, pivot)
             new_clusters.append(rotated)
-            new_death_pits.update(rotated)
+            new_death_pits.update(
+                cell for cell in rotated if self.is_cell_in_bounds(*cell)
+            )
 
         self.fire_clusters = new_clusters
         self.death_pits = new_death_pits
 
-        # fire pit passable so it can trigger
         for r, c in self.death_pits:
             self.grid[r][c] = True
 
-    def reset(self) -> Tuple[int, int]: # reset episode and return to start
+    def reset(self) -> Tuple[int, int]:
+        for r, c in self.death_pits:
+            if self.is_cell_in_bounds(r, c):
+                py = r * self.CELL_SIZE + self.CELL_SIZE // 2
+                px = c * self.CELL_SIZE + self.CELL_SIZE // 2
+                py = min(py, self.loader.maze_array.shape[0] - 1)
+                px = min(px, self.loader.maze_array.shape[1] - 1)
+                self.grid[r][c] = bool(self.loader.maze_array[py, px])
+
         self.agent_pos = self.start_cell
         self.turn_count = 0
         self.death_count = 0
         self.confused_count = 0
+        self.teleport_count = 0
         self.confused_turns_left = 0
         self.cells_explored = set()
         self.episode_active = True
 
-        # restore original fire pit layout on reset
-        for r, c in self.death_pits:
-            py = r * self.CELL_SIZE + self.CELL_SIZE // 2
-            px = c * self.CELL_SIZE + self.CELL_SIZE // 2
-            py = min(py, self.loader.maze_array.shape[0] - 1)
-            px = min(px, self.loader.maze_array.shape[1] - 1)
-            self.grid[r][c] = bool(self.loader.maze_array[py, px])
-
         self.death_pits = set(self.initial_death_pits)
         self.fire_clusters = [list(cluster) for cluster in self.initial_fire_clusters]
+        self.fire_cluster_pivots = list(self.initial_fire_cluster_pivots)
 
         for r, c in self.death_pits:
             self.grid[r][c] = True
 
         return self.agent_pos
 
-    def is_passable(self, row: int, col: int) -> bool: # check if cell is within bounds and not a wall
+    def is_passable(self, row: int, col: int) -> bool:
         h = self.loader.maze_height_cells
         w = self.loader.maze_width_cells
         if not (0 <= row < h and 0 <= col < w):
             return False
         return self.grid[row][col]
 
-    def step(self, actions: List[Action]) -> TurnResult: # execute 5 actions sequentially
+    def is_move_passable(self, from_r: int, from_c: int, to_r: int, to_c: int,
+                         from_hazard: bool = False, to_hazard: bool = False) -> bool:
+        h = self.loader.maze_height_cells
+        w = self.loader.maze_width_cells
+        if not (0 <= to_r < h and 0 <= to_c < w):
+            return False
+
+        from_is_hazard = from_hazard or (from_r, from_c) in self.death_pits \
+            or (from_r, from_c) in self.confusion_pads \
+            or (from_r, from_c) in self.teleport_map
+        to_is_hazard   = to_hazard   or (to_r,   to_c)   in self.death_pits \
+            or (to_r,   to_c)   in self.confusion_pads \
+            or (to_r,   to_c)   in self.teleport_map
+
+        ma    = self.loader.maze_array
+        CELL  = self.CELL_SIZE
+        BORDER = 1
+
+        dr = to_r - from_r
+
+        if dr == 0:  # horizontal
+            right_c = max(from_c, to_c)
+
+            wall_x = right_c * CELL + BORDER
+            y = min(from_r * CELL + CELL // 2 + BORDER, ma.shape[0] - 1)
+
+            x_left  = min(wall_x - 1, ma.shape[1] - 1)
+            x_right = min(wall_x + 1, ma.shape[1] - 1)
+            x_boundary = min(wall_x, ma.shape[1] - 1)
+
+            if not bool(ma[y, x_boundary]):
+                return False
+
+            if from_c < to_c:
+                from_px, to_px = x_left, x_right
+            else:
+                from_px, to_px = x_right, x_left
+
+            if (not from_is_hazard) and (not bool(ma[y, from_px])):
+                return False
+            if (not to_is_hazard) and (not bool(ma[y, to_px])):
+                return False
+            return True
+
+        else:  # vertical
+            bottom_r = max(from_r, to_r)
+
+            wall_y = bottom_r * CELL + BORDER
+            x = min(from_c * CELL + CELL // 2 + BORDER, ma.shape[1] - 1)
+
+            y_top    = min(wall_y - 1, ma.shape[0] - 1)
+            y_bottom = min(wall_y + 1, ma.shape[0] - 1)
+            y_boundary = min(wall_y, ma.shape[0] - 1)
+
+            if not bool(ma[y_boundary, x]):
+                return False
+
+            if from_r < to_r:
+                from_py, to_py = y_top, y_bottom
+            else:
+                from_py, to_py = y_bottom, y_top
+
+            if (not from_is_hazard) and (not bool(ma[from_py, x])):
+                return False
+            if (not to_is_hazard) and (not bool(ma[to_py, x])):
+                return False
+            return True
+
+    def step(self, actions: List[Action]) -> TurnResult:
         if not actions or len(actions) > 5:
             raise ValueError("Must submit 1-5 actions per turn.")
 
         result = TurnResult()
         result.current_position = self.agent_pos
 
-        # confusion carries over from previous turn
         currently_confused = self.confused_turns_left > 0
 
         for i, raw_action in enumerate(actions):
-            # apply confusion if active
             action = self.INVERT[raw_action] if currently_confused else raw_action
 
             if action == Action.WAIT:
@@ -274,58 +371,68 @@ class MazeEnvironment:
             r, c = self.agent_pos
             nr, nc = r + dr, c + dc
 
-            # check wall
-            if not self.is_passable(nr, nc):
+            _src_hazard = ((r, c) in self.death_pits or (r, c) in self.confusion_pads
+                           or (r, c) in self.teleport_map)
+            _dst_hazard = ((nr, nc) in self.death_pits or (nr, nc) in self.confusion_pads
+                           or (nr, nc) in self.teleport_map)
+            if not self.is_move_passable(r, c, nr, nc,
+                                         from_hazard=_src_hazard, to_hazard=_dst_hazard):
                 result.wall_hits += 1
                 result.actions_executed += 1
                 continue
 
-            # move agent
             self.agent_pos = (nr, nc)
             self.cells_explored.add(self.agent_pos)
             result.actions_executed += 1
+            result.positions_visited.append(self.agent_pos)
 
-            # teleport check
             if self.agent_pos in self.teleport_map:
+                src = self.agent_pos
                 dest = self.teleport_map[self.agent_pos]
                 self.agent_pos = dest
                 result.teleported = True
                 result.current_position = self.agent_pos
-                # continue executing remaining actions from new position
+                result.last_event = f"TELEPORT {src}->{dest}"
+                self.teleport_count += 1
 
-            # confusion check
             if self.agent_pos in self.confusion_pads:
                 result.is_confused = True
-                self.confused_turns_left = 2 # rest of this turn + next full turn
+                self.confused_turns_left = 2
                 self.confused_count += 1
-                currently_confused = True # affects remaining actions this turn
+                currently_confused = True
+                result.last_event = f"CONFUSED at {self.agent_pos}"
 
-            # death pit check
             if self.agent_pos in self.death_pits:
                 result.is_dead = True
                 self.death_count += 1
                 result.current_position = self.agent_pos # position of pit
-                self.agent_pos = self.start_cell # respawn
-                break # remaining actions ignored
+                result.last_event = f"DEATH at {self.agent_pos}"
+                self.agent_pos = self.start_cell
+                break
 
-            # goal check
             if self.agent_pos == self.goal_cell:
                 result.is_goal_reached = True
                 result.current_position = self.agent_pos
                 self.episode_active = False
                 break
 
-        if not result.is_dead:
-            result.current_position = self.agent_pos
-
-        # decrement confusion counter at end of turn
         if self.confused_turns_left > 0:
             self.confused_turns_left -= 1
 
-        # rotate all fire clusters 90 degrees clockwise after actions complete
-        self.rotate_fire_clusters()
-
         self.turn_count += 1
+
+        if self.rotate_fire_enabled and self.turn_count % 5 == 0:
+            self.rotate_fire_clusters()
+
+            if not result.is_dead and self.agent_pos in self.death_pits:
+                result.is_dead = True
+                self.death_count += 1
+                result.current_position = self.agent_pos
+                result.last_event = f"DEATH by rotating fire at {self.agent_pos}"
+                self.agent_pos = self.start_cell
+
+        if not result.is_dead:
+            result.current_position = self.agent_pos
         return result
 
     def get_episode_stats(self) -> dict:
@@ -338,8 +445,7 @@ class MazeEnvironment:
         }
 
 # draw red square over every death pit cell and save to output_path
-def visualize_fire_pits(env: MazeEnvironment, output_path: str, base_image_path: str): # <- should move this to mazeEnv class and update the calss
-    # draw a red square over every current death pit cell and save to output_path
+def visualize_fire_pits(env: MazeEnvironment, output_path: str, base_image_path: str):
     img = Image.open(base_image_path).convert("RGB")
     pixels = img.load()
     marker = 4
@@ -362,8 +468,7 @@ class DemoAgent:
     def __init__(self, env: MazeEnvironment):
         self.env = env
 
-    # BFS pathfinding to target cell optionally avoiding certain cells
-    def path_to(self, target: Tuple[int, int], avoid: set = None) -> List[Action]: 
+    def path_to(self, target: Tuple[int, int], avoid: set = None) -> List[Action]:
         start = self.env.agent_pos
         if start == target:
             return []
@@ -380,9 +485,14 @@ class DemoAgent:
                 if action == Action.WAIT:
                     continue
                 nxt = (r + dr, c + dc)
-                if (nxt not in visited
-                        and nxt not in avoid
-                        and self.env.is_passable(nxt[0], nxt[1])):
+                if nxt in visited or nxt in avoid:
+                    continue
+                src_hazard = ((r, c) in self.env.death_pits or (r, c) in self.env.confusion_pads
+                              or (r, c) in self.env.teleport_map)
+                dst_hazard = (nxt in self.env.death_pits or nxt in self.env.confusion_pads
+                              or nxt in self.env.teleport_map)
+                if self.env.is_move_passable(r, c, nxt[0], nxt[1],
+                                             from_hazard=src_hazard, to_hazard=dst_hazard):
                     visited[nxt] = ((r, c), action)
                     queue.append(nxt)
 
@@ -397,7 +507,6 @@ class DemoAgent:
             
         return list(reversed(actions))
 
-    # walk through sequence of actions and print each turnresult
     def walk(self, actions: List[Action], label: str = ""):
         last = None
         for i in range(0, len(actions), 5):
@@ -405,19 +514,18 @@ class DemoAgent:
             last = result
             if label:
                 print(f"  [{label}] {result}")
-            if result.is_dead or result.is_goal_reached:
+            if result.is_dead or result.is_goal_reached or result.teleported:
                 return result
         return last
 
-    # navigate to target avoiding specified cells
     def walk_to(self, target: Tuple[int, int], label: str = "", avoid: set = None):
         actions = self.path_to(target, avoid=avoid)
         if not actions:
             return
         return self.walk(actions, label)
 
-    # navigate to cell adjacent to target w the same optional avoidance
-    def step_onto(self, target: Tuple[int, int], avoid: set = None) -> TurnResult:
+    def reachable_step_to(self, target: Tuple[int, int], avoid: set = None) -> Optional[Tuple[Tuple[int, int], Action]]:
+        avoid = avoid or set()
         r, c = target
         candidates = [
             ((r - 1, c), Action.MOVE_DOWN),
@@ -425,13 +533,78 @@ class DemoAgent:
             ((r, c - 1), Action.MOVE_RIGHT),
             ((r, c + 1), Action.MOVE_LEFT),
         ]
-        
+
+        current_adj = None
+        for adj, step_action in candidates:
+            if adj == self.env.agent_pos:
+                current_adj = (adj, step_action)
+                break
+        if current_adj is not None:
+            candidates = [current_adj] + [item for item in candidates if item != current_adj]
+
         for adj, step_action in candidates:
             if not self.env.is_passable(adj[0], adj[1]):
                 continue
+            if adj in avoid:
+                continue
+            adj_hazard = (adj in self.env.death_pits or adj in self.env.confusion_pads
+                          or adj in self.env.teleport_map)
+            tgt_hazard = (target in self.env.death_pits or target in self.env.confusion_pads
+                          or target in self.env.teleport_map)
+            if not self.env.is_move_passable(adj[0], adj[1], r, c,
+                                             from_hazard=adj_hazard, to_hazard=tgt_hazard):
+                continue
+            path = self.path_to(adj, avoid=avoid | {target})
+            if path or self.env.agent_pos == adj:
+                return adj, step_action
+        return None
+
+    def find_reachable_probe(self, hazard_cells, avoid: set = None) -> Optional[Tuple[Tuple[int, int], Tuple[int, int], Action]]:
+        avoid = avoid or set()
+        for target in hazard_cells:
+            step_info = self.reachable_step_to(target, avoid=avoid)
+            if step_info is not None:
+                adj, step_action = step_info
+                return target, adj, step_action
+        return None
+
+    def find_any_probe(self, hazard_cells) -> Optional[Tuple[Tuple[int, int], Tuple[int, int], Action]]:
+        for target in hazard_cells:
+            r, c = target
+            candidates = [
+                ((r - 1, c), Action.MOVE_DOWN),
+                ((r + 1, c), Action.MOVE_UP),
+                ((r, c - 1), Action.MOVE_RIGHT),
+                ((r, c + 1), Action.MOVE_LEFT),
+            ]
+            for adj, step_action in candidates:
+                if not self.env.is_passable(adj[0], adj[1]):
+                    continue
+                adj_hazard = (adj in self.env.death_pits or adj in self.env.confusion_pads
+                              or adj in self.env.teleport_map)
+                tgt_hazard = (target in self.env.death_pits or target in self.env.confusion_pads
+                              or target in self.env.teleport_map)
+                if self.env.is_move_passable(adj[0], adj[1], r, c,
+                                             from_hazard=adj_hazard, to_hazard=tgt_hazard):
+                    return target, adj, step_action
+        return None
+
+    def find_reachable_hazard(self, hazard_cells, avoid: set = None) -> Optional[Tuple[int, int]]:
+        """Return the first hazard cell in hazard_cells that has a reachable adjacent cell
+        from which the agent can actually step onto the hazard (no wall between them)."""
+        avoid = avoid or set()
+        for target in hazard_cells:
+            if self.reachable_step_to(target, avoid=avoid) is not None:
+                return target
+        return None
+
+    # navigate to cell adjacent to target w the same optional avoidance
+    def step_onto(self, target: Tuple[int, int], avoid: set = None) -> TurnResult:
+        step_info = self.reachable_step_to(target, avoid=avoid)
+        if step_info is not None:
+            adj, step_action = step_info
             if self.env.agent_pos != adj:
-                self.walk_to(adj, avoid=avoid)
-            # only step if navigation succeeded
+                self.walk_to(adj, avoid=(avoid or set()) | {target})
             if self.env.agent_pos == adj:
                 return self.env.step([step_action])
         return self.env.step([Action.WAIT])
@@ -451,13 +624,19 @@ class DemoAgent:
 
         # death pit demo
         if self.env.death_pits:
-            pit = next(iter(self.env.death_pits))
+            avoid_non_death = self.env.confusion_pads | set(self.env.teleport_map.keys())
+            pit = self.find_reachable_hazard(self.env.death_pits, avoid=avoid_non_death)
+            if pit is None:
+                pit = next(iter(self.env.death_pits))  # fallback
             print(f"Death Pit @ cell {pit}")
             print(f"  Expected : is_dead=True, agent respawns at start")
             print(f"  Before   : {self.env.agent_pos}")
-            
-            # avoid other hazards during navigation
-            result = self.step_onto(pit, avoid=all_hazards - {pit})
+
+            self.env.freeze_fire = True
+            result = self.walk(self.path_to(pit, avoid=avoid_non_death), label="->pit")
+            self.env.freeze_fire = False
+            if result is None:
+                result = TurnResult()
             print(f"  Result   : {result}")
             
             ok = "ok" if result.is_dead else "nope"
@@ -470,18 +649,38 @@ class DemoAgent:
 
         # confusion demo
         if self.env.confusion_pads:
-            pad = next(iter(self.env.confusion_pads))
+            probe = self.find_reachable_probe(self.env.confusion_pads, avoid=self.env.death_pits)
+            repositioned = False
+            if probe is None:
+                probe = self.find_any_probe(self.env.confusion_pads)
+                repositioned = probe is not None
+            if probe is None:
+                pad = None
+            else:
+                pad, adj, probe_action = probe
+        else:
+            pad = None
+            repositioned = False
+
+        if pad is not None:
             print(f"Confusion Pad @ cell {pad}")
             print(f"  Expected : is_confused=True, MOVE_UP executes as MOVE_DOWN")
+            if repositioned:
+                self.env.agent_pos = adj
+                print(f"  Repositioned next to pad at {adj} for direct verification")
             # clear any leftover confusion from navigation
             self.env.confused_turns_left = 0
-            result = self.step_onto(pad, avoid=all_hazards - {pad})
+            self.env.freeze_fire = True
+            if repositioned:
+                result = self.env.step([probe_action])
+            else:
+                result = self.step_onto(pad, avoid=self.env.death_pits)
+            self.env.freeze_fire = False
             # ensure confusion is registered even if pad was hit mid navigation
             if result.is_confused or self.env.confused_turns_left > 0:
                 self.env.confused_turns_left = max(self.env.confused_turns_left, 1)
-                confused_active = True
             else:
-                confused_active = False
+                self.env.confused_turns_left = 0
                 
             print(f"  Result   : {result}")
             ok = "ok" if result.is_confused else "nope"
@@ -500,24 +699,58 @@ class DemoAgent:
                 verdict = "no row change (blocked both directions)"
             print(f"  Sent MOVE_UP while confused -> row change={dr:+d}  {verdict}")
             print()
+        elif self.env.confusion_pads:
+            print("No reachable confusion pads detected.\n")
         else:
             print("No confusion pads detected.\n")
 
         # teleport demo
         if self.env.teleport_map:
-            src = next(iter(self.env.teleport_map))
-            dst = self.env.teleport_map[src]
-            print(f"Teleport Pad @ cell {src} -> dest {dst}")
-            print(f"  Expected : teleported=True, position jumps to {dst}")
-            # clear confusion so navigation is reliable
+            self.env.agent_pos = self.env.start_cell
             self.env.confused_turns_left = 0
-            result = self.step_onto(src, avoid=self.env.death_pits | self.env.confusion_pads)
-            print(f"  Result   : {result}")
-            ok = "ok" if result.teleported else "nope"
-            match_ok = "ok" if self.env.agent_pos == dst else "nope"
-            print(f"  teleported={result.teleported} {ok}  /  "
-                  f"landed at {self.env.agent_pos}  expected {dst} {match_ok}")
-            print()
+            teleport_pads = set(self.env.teleport_map.keys())
+            src = None
+            dst = None
+            src_adj = None
+            src_action = None
+            repositioned = False
+            for candidate in teleport_pads:
+                candidate_dst = self.env.teleport_map[candidate]
+                candidate_avoid = self.env.death_pits | self.env.confusion_pads | (teleport_pads - {candidate})
+                probe = self.find_reachable_probe([candidate], avoid=candidate_avoid)
+                if probe is not None:
+                    src, src_adj, src_action = probe
+                    dst = candidate_dst
+                    break
+            if src is None:
+                for candidate in teleport_pads:
+                    probe = self.find_any_probe([candidate])
+                    if probe is not None:
+                        src, src_adj, src_action = probe
+                        dst = self.env.teleport_map[candidate]
+                        repositioned = True
+                        break
+            if src is None:
+                print("No reachable teleport pads detected.\n")
+            else:
+                print(f"Teleport Pad @ cell {src} -> dest {dst}")
+                print(f"  Expected : teleported=True, position jumps to {dst}")
+                if repositioned:
+                    self.env.agent_pos = src_adj
+                    print(f"  Repositioned next to pad at {src_adj} for direct verification")
+                teleport_avoid = self.env.death_pits | self.env.confusion_pads | (teleport_pads - {src})
+                self.env.freeze_fire = True
+                if repositioned:
+                    result = self.env.step([src_action])
+                else:
+                    result = self.step_onto(src, avoid=teleport_avoid)
+                self.env.freeze_fire = False
+                print(f"  Result   : {result}")
+                ok = "ok" if result.teleported else "nope"
+                match_ok = "ok" if self.env.agent_pos == dst else "nope"
+                print(f"  teleported={result.teleported} {ok}  /  "
+                      f"landed at {self.env.agent_pos}  expected {dst} {match_ok}")
+                print()
         else:
             print("No teleport pads detected.\n")
 
@@ -531,7 +764,7 @@ class DemoAgent:
         print(f"{sep}\n")
 
 if __name__ == "__main__":
-    MAZE_PATH = "MAZE_1.png"
+    MAZE_PATH = sys.argv[1] if len(sys.argv) > 1 else "maze-alpha/MAZE_1.png"
 
     print("Loading maze with hazards")
     env = MazeEnvironment(MAZE_PATH)
