@@ -4,8 +4,8 @@ from typing import List, Tuple, Optional
 
 from collections import deque
 from PIL import Image
-from sklearn import cluster
-from maze_cnn import CnnMazeLoader
+from maze import MazeLoader          # colour-based loader — no CNN needed
+
 
 class Action(Enum):
     MOVE_UP = 0
@@ -56,7 +56,7 @@ class MazeEnvironment:
     }
 
     def __init__(self, maze_image_path: str):
-        self.loader = CnnMazeLoader(maze_image_path)
+        self.loader = MazeLoader(maze_image_path)
         self.loader.detect_hazards()
 
         h_cells = self.loader.maze_height_cells
@@ -75,13 +75,57 @@ class MazeEnvironment:
         self.start_cell = self.loader.pixel_to_cell(sp[0], sp[1])
         self.goal_cell  = self.loader.pixel_to_cell(gp[0], gp[1])
 
+        self.confusion_pads      = set(map(tuple, self.loader.confusion_pads))
         self.death_pits          = set(map(tuple, self.loader.death_pits))
+        # Pass 1 — remove explicit overlap (colour-detected confusion pads)
+        self.death_pits         -= self.confusion_pads
+        # Pass 2 — pixel colour analysis.
+        # Fire pit cells contain orange-red flame pixels (R >> G, B low).
+        # Confusion pad cells have a different colour profile.
+        # This works even when confusion pads are adjacent to fire pits.
+        try:
+            import numpy as _np
+            _img_arr = _np.array(Image.open(maze_image_path).convert('RGB'))
+            _CS      = self.CELL_SIZE
+            _pixel_fixed = set()
+            _debug_rows  = []
+            for (_r, _c) in list(self.death_pits):
+                _y1 = _r * _CS + 3
+                _y2 = min((_r + 1) * _CS - 3, _img_arr.shape[0])
+                _x1 = _c * _CS + 3
+                _x2 = min((_c + 1) * _CS - 3, _img_arr.shape[1])
+                _patch = _img_arr[_y1:_y2, _x1:_x2].reshape(-1, 3).astype(_np.float32)
+                # Non-white pixels only (exclude corridor background)
+                _nw = _patch[_patch.max(axis=1) < 230]
+                if len(_nw) < 4:
+                    _pixel_fixed.add((_r, _c)); continue
+                _R, _G, _B = _nw[:, 0], _nw[:, 1], _nw[:, 2]
+                # Fire-like: red dominant, orange hue, low blue
+                _fire_mask = (_R > 140) & (_R > _G * 1.4) & (_B < 120)
+                _frac = float(_fire_mask.sum()) / len(_nw)
+                _mr, _mg, _mb = int(_nw[:,0].mean()), int(_nw[:,1].mean()), int(_nw[:,2].mean())
+                _debug_rows.append((_r, _c, _frac, _mr, _mg, _mb))
+                if _frac < 0.25:
+                    _pixel_fixed.add((_r, _c))
+            self.confusion_pads |= _pixel_fixed
+            self.death_pits     -= _pixel_fixed
+            print(f"[ENV] death_pits={len(self.death_pits)}"
+                  f"  confusion_pads={len(self.confusion_pads)}"
+                  f"  (pixel→confusion: {len(_pixel_fixed)})")
+            # Show the lowest-fire-fraction cells so threshold can be tuned
+            for (_r, _c, _f, _mr, _mg, _mb) in sorted(_debug_rows, key=lambda x: x[2])[:6]:
+                _tag = "→confusion" if (_r, _c) in _pixel_fixed else "fire"
+                print(f"    ({_r:2d},{_c:2d}) fire_frac={_f:.2f}"
+                      f"  avg_rgb=({_mr},{_mg},{_mb})  [{_tag}]")
+        except Exception as _ex:
+            print(f"[ENV] pixel analysis skipped ({_ex}); "
+                  f"death_pits={len(self.death_pits)}"
+                  f"  confusion_pads={len(self.confusion_pads)}") 
         self.initial_death_pits  = set(self.death_pits)
         self.fire_clusters = self.group_clusters(self.death_pits, max_gap=3)
         self.initial_fire_clusters = [list(c) for c in self.fire_clusters]
         self._fire_rotation_states = self._precompute_fire_states()
         self._fire_rot_idx = 0
-        self.confusion_pads      = set(map(tuple, self.loader.confusion_pads))
 
         all_hazard_cells = (
             self.death_pits | self.confusion_pads
@@ -93,7 +137,9 @@ class MazeEnvironment:
             self.grid[r][c] = True
 
         self.teleport_map: dict = {}
-        for group in [self.loader.teleport_purple, self.loader.teleport_orange, self.loader.teleport_green]:
+        for group in [self.loader.teleport_purple,
+                      self.loader.teleport_orange,
+                      self.loader.teleport_green]:
             pads = [tuple(p) for p in group]
             for i, pad in enumerate(pads):
                 dest = pads[(i + 1) % len(pads)] if len(pads) > 1 else pad
@@ -106,33 +152,26 @@ class MazeEnvironment:
         self.confused_turns_left : int  = 0
         self.cells_explored      : set  = set()
         self.episode_active      : bool = True
-        self._fire_turn_counter  : int  = 0   # fire rotates every turn
+        self._fire_turn_counter  : int  = 0
 
-        # ── BUILD ADJACENCY (fixes wall-detection) ────────────────────────────
+        # ── BUILD ADJACENCY ───────────────────────────────────────────────────
         self._build_adjacency()
 
     # ── Adjacency from boundary pixels ───────────────────────────────────────
     def _build_adjacency(self):
-        """
-        Check the pixel ON the shared edge between adjacent cells.
-        Cell centres are always white, so is_passable() alone never
-        detects walls — we must sample the boundary pixel instead.
-        """
         h  = self.loader.maze_height_cells
         w  = self.loader.maze_width_cells
-        ma = self.loader.maze_array          # True = bright = open
+        ma = self.loader.maze_array
 
         self.adj = [[set() for _ in range(w)] for _ in range(h)]
         for r in range(h):
             for c in range(w):
-                # south boundary (between row r and r+1)
                 if r + 1 < h:
-                    by = min((r + 1) * self.CELL_SIZE,               ma.shape[0] - 1)
+                    by = min((r + 1) * self.CELL_SIZE,                ma.shape[0] - 1)
                     bx = min(c * self.CELL_SIZE + self.CELL_SIZE // 2, ma.shape[1] - 1)
                     if ma[by, bx]:
                         self.adj[r    ][c].add((r + 1, c))
                         self.adj[r + 1][c].add((r,     c))
-                # east boundary (between col c and c+1)
                 if c + 1 < w:
                     by = min(r * self.CELL_SIZE + self.CELL_SIZE // 2, ma.shape[0] - 1)
                     bx = min((c + 1) * self.CELL_SIZE,                 ma.shape[1] - 1)
@@ -160,23 +199,6 @@ class MazeEnvironment:
 
     # ── Border-aware apex pivot ───────────────────────────────────────────────
     def _find_pivot(self, cluster: list) -> Tuple[int, int]:
-        """
-        Select the rotation pivot for a fire cluster.
-
-        Priority 1 — Border cell:
-            If any cell touches the grid edge (row 0, row H-1, col 0, col W-1),
-            use the border cell with the most in-cluster neighbours.
-            Rotating around the wall-touching corner swings the free arm inward,
-            guaranteeing the rotation stays in-bounds without the fallback "stay".
-
-        Priority 2 — Geometric apex:
-            Among cells with exactly 2 in-cluster neighbours, find the one whose
-            two neighbours form the widest angle (highest cosine).  This is the
-            bend / tip of the shape — the natural rotation centre.
-
-        Priority 3 — Centroid snap:
-            Nearest cell to the centroid (single-cell or degenerate clusters).
-        """
         if len(cluster) <= 1:
             return cluster[0]
 
@@ -184,7 +206,6 @@ class MazeEnvironment:
         w = self.loader.maze_width_cells
         cluster_set = set(map(tuple, cluster))
 
-        # ── Priority 1: border cell ──────────────────────────────────────────
         border_cells = [
             (r, c) for r, c in cluster
             if r == 0 or r == h - 1 or c == 0 or c == w - 1
@@ -198,7 +219,6 @@ class MazeEnvironment:
                 )
             return max(border_cells, key=_nbr_count)
 
-        # ── Priority 2: geometric apex ───────────────────────────────────────
         best_cell, best_score = None, -float('inf')
         for r, c in cluster:
             nbrs = [
@@ -221,24 +241,13 @@ class MazeEnvironment:
         if best_cell is not None:
             return best_cell
 
-        # ── Priority 3: centroid snap ────────────────────────────────────────
         rows = [r for r, _ in cluster]
         cols = [c for _, c in cluster]
         cr   = sum(rows) / len(rows)
         cc   = sum(cols) / len(cols)
         return min(cluster, key=lambda cell: (cell[0] - cr) ** 2 + (cell[1] - cc) ** 2)
 
-    # ── Single 90° CW rotation around a fixed pivot ──────────────────────────
     def _rotate_cluster_90(self, cluster: list, origin_cluster: list) -> list:
-        """
-        Rotate `cluster` 90° CW around the pivot derived from `origin_cluster`.
-
-        The pivot is computed once from the *original* cluster so it stays
-        consistent across all four rotation states.  If any rotated cell would
-        land outside the grid the rotation is skipped and the original cluster
-        is returned unchanged (safety net — should only trigger on truly
-        degenerate single-cell clusters after the border-pivot fix).
-        """
         if len(origin_cluster) <= 1:
             return sorted(cluster)
 
@@ -253,16 +262,11 @@ class MazeEnvironment:
             nr = pr + dc
             nc = pc - dr
             if not (0 <= nr < h and 0 <= nc < w):
-                return sorted(origin_cluster)   # out-of-bounds safety fallback
+                return sorted(origin_cluster)
             rotated.append((nr, nc))
         return sorted(rotated)
 
     def _precompute_fire_states(self) -> list:
-        """
-        Build 4 rotation states. Each state rotates the PREVIOUS state
-        90° around the pivot derived from the ORIGINAL cluster — guaranteed
-        to cycle back to the start after 4 steps.
-        """
         states    = [frozenset(self.death_pits)]
         originals = [list(c) for c in self.initial_fire_clusters]
         current   = [list(c) for c in self.initial_fire_clusters]
@@ -306,6 +310,10 @@ class MazeEnvironment:
             return False
         return self.grid[row][col]
 
+    def is_cell_in_bounds(self, r: int, c: int) -> bool:
+        return (0 <= r < self.loader.maze_height_cells
+                and 0 <= c < self.loader.maze_width_cells)
+
     def step(self, actions: List[Action]) -> TurnResult:
         if not actions or len(actions) > 5:
             raise ValueError("Must submit 1-5 actions per turn.")
@@ -325,7 +333,7 @@ class MazeEnvironment:
             r,  c  = self.agent_pos
             nr, nc = r + dr, c + dc
 
-            # ── FIXED wall check: use adjacency, not cell-centre pixel ────────
+            # Use adjacency graph for wall detection
             if (nr, nc) not in self.adj[r][c]:
                 result.wall_hits += 1
                 result.actions_executed += 1
@@ -365,26 +373,9 @@ class MazeEnvironment:
         if self.confused_turns_left > 0:
             self.confused_turns_left -= 1
 
-        # # fire rotates 90° every 5 turns
-        # self._fire_turn_counter += 1
-        # if self._fire_turn_counter >= 5:
-        #     self._fire_turn_counter = 0
-        #     self._fire_rot_idx = (self._fire_rot_idx + 1) % 4
-        #     # clear old pits
-        #     for r, c in self.death_pits:
-        #         py = min(r*self.CELL_SIZE + self.CELL_SIZE//2, self.loader.maze_array.shape[0]-1)
-        #         px = min(c*self.CELL_SIZE + self.CELL_SIZE//2, self.loader.maze_array.shape[1]-1)
-        #         self.grid[r][c] = bool(self.loader.maze_array[py, px])
-        #     self.death_pits = set(self._fire_rotation_states[self._fire_rot_idx])
-        #     for r, c in self.death_pits:
-        #         self.grid[r][c] = True
-
-        # self.turn_count += 1
-        # return result
-        # fire rotates 90° every turn
+        # Fire rotates 90° every turn
         self._fire_rot_idx = (self._fire_rot_idx + 1) % 4
 
-        # clear old pits
         for r, c in self.death_pits:
             py = min(r * self.CELL_SIZE + self.CELL_SIZE // 2, self.loader.maze_array.shape[0] - 1)
             px = min(c * self.CELL_SIZE + self.CELL_SIZE // 2, self.loader.maze_array.shape[1] - 1)
@@ -430,9 +421,9 @@ class DemoAgent:
         self.env = env
 
     def path_to(self, target, avoid=None):
-        start  = self.env.agent_pos
+        start   = self.env.agent_pos
         if start == target: return []
-        avoid  = avoid or set()
+        avoid   = avoid or set()
         visited = {start: None}
         queue   = deque([start])
         while queue:
@@ -530,8 +521,6 @@ if __name__ == "__main__":
 
     print("\nVisualizing fire pit rotation...")
     env.reset()
-    env.confused_turns_left = 0
     visualize_fire_pits(env, "fire_before.png", MAZE_PATH)
-    # env.step([Action.WAIT] * 5)
     env.step([Action.WAIT])
     visualize_fire_pits(env, "fire_after.png", MAZE_PATH)
