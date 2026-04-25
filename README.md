@@ -1,6 +1,6 @@
 # Maze-Solver
 
-Maze navigation agent using D\* Lite incremental replanning and a GA-evolved neural network for fire timing. The agent navigates a 64×64 maze blind — only the goal cell is known at start. All hazards (fire pits, confusion pads, teleporters, arrow pads) are discovered through experience.
+Maze navigation agent using D\* Lite incremental replanning and a GA-evolved neural network for fire timing. The agent navigates a 64×64 maze blind — only the goal cell is known at start. All hazards (fire pits, confusion pads, teleporters, arrow pads) are discovered through experience. Ai was used to aid development during brainstorming, debugging, and researching. It was also used to format this readme!
 
 ---
 
