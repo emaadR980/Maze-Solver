@@ -1,6 +1,6 @@
 # Maze-Solver
 
-Maze navigation agent using D\* Lite incremental replanning and a GA-evolved neural network for fire timing. The agent navigates a 64×64 maze blind — only the goal cell is known at start. All hazards (fire pits, confusion pads, teleporters, arrow pads) are discovered through experience. Ai was used to aid development during brainstorming, debugging, and researching. It was also used to format this readme!
+Maze navigation agent using D\* Lite incremental replanning and a GA-evolved neural network for fire timing. The agent navigates a 64×64 maze blind, with only the goal cell known at start. All hazards (fire pits, confusion pads, teleporters, arrow pads) are discovered through experience. AI was used to aid development during brainstorming, debugging, researching, and providing an initial scaffolding. It was also used to format this README!
 
 ---
 
@@ -114,3 +114,7 @@ Metrics reported:
 | **Confusion pad** | Detected via `TurnResult.is_confused`. Agent tracks `confused_turns_left` and inverts all outgoing actions to compensate. |
 | **Teleporter** | Detected when position jumps unexpectedly vs. intended action. D\* Lite routes through beneficial teleporters as 1-step shortcuts once source→destination is known. |
 | **Arrow pad** | Detected via `TurnResult.arrow_pushed`. Agent records pad cell and direction. D\* Lite assigns cost 2 to known arrow cells (uses full turn, unintended landing). |
+
+## AI prompt Example
+Prompt: "The fire traps are visually moving off their pivot point. Please diagnose"
+Response: "The problem is the centroid is recomputed from the already-rotated cluster each frame, so it drifts as cells get clipped at boundaries. Fix: compute the pivot once when clusters arrive and keep it fixed across all rotations."
