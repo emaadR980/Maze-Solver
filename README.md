@@ -116,5 +116,6 @@ Metrics reported:
 | **Arrow pad** | Detected via `TurnResult.arrow_pushed`. Agent records pad cell and direction. D\* Lite assigns cost 2 to known arrow cells (uses full turn, unintended landing). |
 
 ## AI prompt Example
-Prompt: "The fire traps are visually moving off their pivot point. Please diagnose"
-Response: "The problem is the centroid is recomputed from the already-rotated cluster each frame, so it drifts as cells get clipped at boundaries. Fix: compute the pivot once when clusters arrive and keep it fixed across all rotations."
+**Prompt:** "The fire traps are visually moving off their pivot point. Please diagnose"
+
+**Response:** "The problem is the centroid is recomputed from the already-rotated cluster each frame, so it drifts as cells get clipped at boundaries. Fix: compute the pivot once when clusters arrive and keep it fixed across all rotations."
